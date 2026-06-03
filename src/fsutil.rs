@@ -36,6 +36,20 @@ pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// Like [`create_private`] but exclusive: fails with `AlreadyExists` if the file
+/// exists (O_EXCL). Lets a caller claim the next free filename without ever
+/// clobbering an existing one, even under concurrent writers.
+pub fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +69,32 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         {
             let _f = create_private(&p).unwrap();
+        }
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn create_private_new_refuses_existing() {
+        let p = std::env::temp_dir().join(format!("frtk-excl-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let _f = create_private_new(&p).unwrap(); // first create succeeds
+        }
+        let err = create_private_new(&p).unwrap_err(); // second must fail, not clobber
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_new_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = std::env::temp_dir().join(format!("frtk-exclmode-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let _f = create_private_new(&p).unwrap();
         }
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
