@@ -515,3 +515,86 @@ async fn delta_cache_collapses_identical_reread() {
     std::env::remove_var("FRTK_LEDGER");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// COV-1: exclude_tools with namespaced wire name
+// ---------------------------------------------------------------------------
+
+/// The namespaced wire name `mcp__plugin_figma_figma__get_metadata` must be
+/// excluded when `exclude_tools = ["get_metadata"]` is set. The body must pass
+/// through UNCHANGED and the ledger must remain empty (no compression happened).
+///
+/// TDD: This test must fail BEFORE the fix (bare-name exact-match in
+/// `Config::is_excluded` never matches the namespaced wire name, so the proxy
+/// still compresses it). After the fix it is green.
+#[tokio::test]
+async fn exclude_tools_namespaced_wire_name_passes_through() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-excl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let ledger = base.join("ledger.jsonl");
+    std::env::set_var("FRTK_LEDGER", &ledger);
+
+    // Build a response envelope that uses the NAMESPACED wire name in the request,
+    // and returns pretty-printed content (so compression would shrink it).
+    let pretty_payload = inner_pretty();
+    let upstream_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "content": [{ "type": "text", "text": pretty_payload }] }
+    })
+    .to_string();
+
+    let upstream = spawn_mock(upstream_body.clone(), "application/json").await;
+
+    // Build state with exclude_tools=["get_metadata"] so the bare name excludes
+    // the namespaced wire call.
+    let mut state = proxy::build_state(&upstream, None).unwrap();
+    state.set_exclude_tools(vec!["get_metadata".to_string()]);
+
+    // Send a request using the NAMESPACED wire name.
+    let namespaced_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "mcp__plugin_figma_figma__get_metadata", "arguments": {} }
+    })
+    .to_string();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(namespaced_req))
+        .unwrap();
+    let resp = proxy::app(state).oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    // Body must be forwarded UNCHANGED (upstream_body is already compact JSON,
+    // but the important check is that the content text is NOT minified).
+    let v: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    // The pretty payload was NOT compressed — it must still contain newlines/spaces.
+    assert!(
+        text.contains('\n'),
+        "excluded tool body must pass through unchanged (still pretty-printed), got: {text:?}"
+    );
+    // And it must equal the original pretty_payload exactly.
+    assert_eq!(
+        text, pretty_payload,
+        "excluded tool body must be byte-identical to what the upstream sent"
+    );
+
+    // Ledger must be empty — no StatRec was written.
+    let ledger_content = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert!(
+        ledger_content.trim().is_empty(),
+        "ledger must be empty for excluded tool, got: {ledger_content:?}"
+    );
+
+    std::env::remove_var("FRTK_LEDGER");
+    let _ = std::fs::remove_dir_all(&base);
+}

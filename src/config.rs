@@ -52,8 +52,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// Return true when `tool` (a possibly-namespaced wire name such as
+    /// `mcp__plugin_figma_figma__get_metadata`) matches any entry in
+    /// `exclude_tools` (which stores bare names like `get_metadata`).
+    /// Delegates to [`crate::filter::matches_tool`] so the `__` boundary rule
+    /// is enforced and a short name cannot accidentally match a longer one.
     pub fn is_excluded(&self, tool: &str) -> bool {
-        self.exclude_tools.iter().any(|t| t == tool)
+        self.exclude_tools
+            .iter()
+            .any(|t| crate::filter::matches_tool(tool, t))
     }
 }
 
@@ -148,6 +155,28 @@ mod tests {
         assert!(c.is_excluded("whoami"));
         assert_eq!(c.tee.mode, TeeMode::Always);
         assert!(c.cache.delta);
+    }
+
+    #[test]
+    fn is_excluded_matches_namespaced_wire_name() {
+        let c = Config {
+            exclude_tools: vec!["get_metadata".to_string()],
+            ..Default::default()
+        };
+        // Bare name: exact match.
+        assert!(c.is_excluded("get_metadata"), "bare name must match");
+        // Namespaced wire name must also match via the __ boundary.
+        assert!(
+            c.is_excluded("mcp__plugin_figma_figma__get_metadata"),
+            "namespaced wire name must match bare exclude entry"
+        );
+        // A name sharing the suffix but lacking __ boundary must NOT match.
+        assert!(
+            !c.is_excluded("evil_get_metadata"),
+            "no __ boundary must NOT match"
+        );
+        // An unrelated tool must not be excluded.
+        assert!(!c.is_excluded("get_design_context"), "unrelated tool must not be excluded");
     }
 
     #[test]

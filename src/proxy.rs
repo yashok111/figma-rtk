@@ -71,6 +71,11 @@ pub struct AppState {
     filters: Arc<FilterSet>,
     /// Opt-in delta cache (None = disabled).
     delta_cache: Option<Arc<DeltaCache>>,
+    /// Bare tool names whose responses are forwarded without compression.
+    /// Matched using [`crate::filter::matches_tool`] so namespaced wire names
+    /// (`mcp__plugin_figma_figma__get_metadata`) are correctly excluded by a
+    /// bare entry (`get_metadata`).
+    exclude_tools: Vec<String>,
 }
 
 impl AppState {
@@ -84,6 +89,12 @@ impl AppState {
     /// Enable the opt-in delta cache.
     pub fn set_delta_cache(&mut self, cache: Option<Arc<DeltaCache>>) {
         self.delta_cache = cache;
+    }
+
+    /// Set the list of bare tool names to skip compression for (see `exclude_tools`
+    /// in the config). Used by `serve` and by integration tests.
+    pub fn set_exclude_tools(&mut self, tools: Vec<String>) {
+        self.exclude_tools = tools;
     }
 }
 
@@ -135,6 +146,7 @@ pub fn build_state_with_timeouts(
         level: Level::Standard,
         filters: Arc::new(FilterSet::default()),
         delta_cache: None,
+        exclude_tools: Vec::new(),
     })
 }
 
@@ -168,6 +180,9 @@ pub async fn serve(
     state.set_filters(level, filters);
     if cfg.cache.delta {
         state.set_delta_cache(Some(Arc::new(DeltaCache::new(256))));
+    }
+    if !cfg.exclude_tools.is_empty() {
+        state.set_exclude_tools(cfg.exclude_tools.clone());
     }
     let app = app(state);
 
@@ -227,11 +242,23 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
 
     // Learn which JSON-RPC ids correspond to heavy read tools so we know which
     // responses to compress. Only POSTs carry tools/call requests.
-    let target_ids = if method == Method::POST {
+    let mut target_ids = if method == Method::POST {
         crate::mcp::extract_targets(&body_bytes)
     } else {
         Default::default()
     };
+
+    // Drop any target whose tool name matches an entry in exclude_tools. The
+    // comparison uses matches_tool so a bare config entry (e.g. "get_metadata")
+    // correctly excludes the namespaced wire name
+    // (e.g. "mcp__plugin_figma_figma__get_metadata").
+    if !st.exclude_tools.is_empty() {
+        target_ids.retain(|_, t| {
+            !st.exclude_tools
+                .iter()
+                .any(|ex| crate::filter::matches_tool(&t.tool, ex))
+        });
+    }
 
     let req_headers = filter_req_headers(&parts.headers);
     let upstream_resp = st
