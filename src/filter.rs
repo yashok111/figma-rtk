@@ -145,8 +145,12 @@ impl FilterSet {
 /// Match a wire tool name against a filter's declared tool: exact, or the wire
 /// name carries an MCP namespace prefix ending in `__<tool>`. The `__` boundary
 /// stops a short name like "a" or "metadata" matching "get_metadata".
+/// Zero-alloc: no heap allocation; uses `strip_suffix` + a slice check.
 pub(crate) fn matches_tool(wire: &str, filter_tool: &str) -> bool {
-    wire == filter_tool || wire.ends_with(&format!("__{filter_tool}"))
+    wire == filter_tool
+        || wire
+            .strip_suffix(filter_tool)
+            .is_some_and(|prefix| prefix.ends_with("__"))
 }
 
 /// JSON value equality that treats integers and floats of equal value as equal,
@@ -287,6 +291,27 @@ mod tests {
         let mut v: Value = serde_json::from_str(r#"{"a":{"b":1}}"#).unwrap();
         apply_value(&mut v, &f1, 0);
         assert_eq!(v, serde_json::json!({"a":"…"}));
+    }
+
+    #[test]
+    fn matches_tool_double_namespaced_and_negative() {
+        // Positive: a double-namespaced wire name must match the bare tool name.
+        assert!(
+            matches_tool("mcp__plugin_figma_figma__get_metadata", "get_metadata"),
+            "double-namespace must match"
+        );
+        // Negative: a name that only ends with the tool name but has no __ boundary must NOT match.
+        assert!(
+            !matches_tool("evil_get_metadata", "get_metadata"),
+            "no __ boundary must NOT match"
+        );
+        // Negative: partial suffix without __ must not match.
+        assert!(
+            !matches_tool("set_metadata", "metadata"),
+            "substring without __ must not match"
+        );
+        // Exact match still works.
+        assert!(matches_tool("get_metadata", "get_metadata"), "exact match");
     }
 
     #[test]

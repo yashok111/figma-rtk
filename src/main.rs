@@ -239,12 +239,8 @@ fn run_compress(
     };
     let toolname = tool.clone().unwrap_or_default();
     let (out, sv) = compress::compress_payload(&input, &toolname, level, &filters);
-    let saved = tokens::est(sv.before).saturating_sub(tokens::est(sv.after));
-    let pct = if sv.before > 0 {
-        100.0 * (sv.before.saturating_sub(sv.after)) as f64 / sv.before as f64
-    } else {
-        0.0
-    };
+    let saved = tokens::tok_saved(sv.before, sv.after);
+    let pct = tokens::pct_saved(sv.before, sv.after);
     eprintln!(
         "frtk compress[{}] level={level:?}  {} -> {} bytes  (~{saved} tokens, {pct:.1}%)",
         tool.as_deref().unwrap_or("stdin"),

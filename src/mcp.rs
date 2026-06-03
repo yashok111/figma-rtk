@@ -33,9 +33,10 @@ pub const TARGET_TOOLS: &[&str] = &[
 fn is_target(name: &str) -> bool {
     // Exact wire name, or MCP-namespaced (…__get_metadata). The `__` boundary
     // stops unrelated names like "evil_get_metadata" being treated as targets.
+    // Delegates to matches_tool which is zero-alloc (no heap allocation).
     TARGET_TOOLS
         .iter()
-        .any(|t| name == *t || name.ends_with(&format!("__{t}")))
+        .any(|t| crate::filter::matches_tool(name, t))
 }
 
 pub fn id_to_string(id: &Value) -> String {
@@ -229,6 +230,20 @@ mod tests {
             tool: tool.to_string(),
             key: format!("{tool}|k"),
         }
+    }
+
+    #[test]
+    fn is_target_double_namespace_and_negative() {
+        // Double-namespaced wire name must be treated as a target.
+        assert!(
+            is_target("mcp__plugin_figma_figma__get_metadata"),
+            "double-namespace must be a target"
+        );
+        // A name sharing the suffix but lacking __ boundary must NOT be a target.
+        assert!(
+            !is_target("evil_get_metadata"),
+            "no __ boundary must NOT be a target"
+        );
     }
 
     #[test]

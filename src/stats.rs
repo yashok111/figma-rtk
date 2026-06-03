@@ -86,15 +86,10 @@ pub fn print_gain(history: bool) -> anyhow::Result<()> {
         e.2 += 1;
     }
 
-    let saved_bytes = tot_before.saturating_sub(tot_after);
     let tok_before = tokens::est(tot_before);
     let tok_after = tokens::est(tot_after);
-    let tok_saved = tok_before.saturating_sub(tok_after);
-    let pct = if tot_before > 0 {
-        100.0 * saved_bytes as f64 / tot_before as f64
-    } else {
-        0.0
-    };
+    let tok_saved = tokens::tok_saved(tot_before, tot_after);
+    let pct = tokens::pct_saved(tot_before, tot_after);
 
     println!("figma-rtk gain");
     println!("──────────────────────────────────────────────");
@@ -106,12 +101,8 @@ pub fn print_gain(history: bool) -> anyhow::Result<()> {
     println!();
     println!("by tool:");
     for (tool, (b, a, c)) in &by_tool {
-        let tp = if *b > 0 {
-            100.0 * (b.saturating_sub(*a)) as f64 / *b as f64
-        } else {
-            0.0
-        };
-        let ts = tokens::est(*b).saturating_sub(tokens::est(*a));
+        let tp = tokens::pct_saved(*b, *a);
+        let ts = tokens::tok_saved(*b, *a);
         println!("  {tool:<22} calls {c:>4}  ~{ts:>8} tok  ({tp:.1}%)");
     }
 
@@ -119,7 +110,7 @@ pub fn print_gain(history: bool) -> anyhow::Result<()> {
         println!();
         println!("recent calls:");
         for r in recs.iter().rev().take(20) {
-            let ts = tokens::est(r.before).saturating_sub(tokens::est(r.after));
+            let ts = tokens::tok_saved(r.before, r.after);
             println!("  [{}] {:<22} ~{} tok saved", r.ts, r.tool, ts);
         }
     }

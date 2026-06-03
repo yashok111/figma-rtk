@@ -2,7 +2,32 @@
 //! sanitization and owner-only file creation (raw payloads can be the user's
 //! design data — keep them out of other local users' reach).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Write `content` to `file` atomically: write a `.frtk-tmp` sibling, then
+/// rename it into place. Rename is atomic on POSIX (and near-atomic on Windows)
+/// and replaces the destination name itself, so a crash never leaves a
+/// half-written file. The tmp is a sibling so it shares the same filesystem as
+/// the destination, making rename cheap and truly atomic (no cross-device copy).
+pub(crate) fn write_atomic(file: &Path, content: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write;
+
+    let mut tmp_os = file.as_os_str().to_owned();
+    tmp_os.push(".frtk-tmp");
+    let tmp = PathBuf::from(tmp_os);
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("creating temp {}", tmp.display()))?;
+        f.write_all(content)?;
+    }
+    std::fs::rename(&tmp, file).with_context(|| format!("finalizing {}", file.display()))?;
+    Ok(())
+}
 
 /// Sanitize a tool name into a safe filename component. Never empty and cannot
 /// contain path separators, so it can't escape the target directory.
