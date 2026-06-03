@@ -9,9 +9,11 @@ use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
+use axum::body::Bytes;
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cache::DeltaCache;
 use crate::config::{Level, TeeMode};
@@ -43,6 +45,17 @@ const RESP_HOP_BY_HOP: &[&str] = &[
 
 /// Max request body we will buffer (tool-call params are tiny; this is a guard).
 const MAX_REQ_BODY: usize = 32 * 1024 * 1024;
+
+/// Max upstream response body we will buffer. Content-Length is advisory and
+/// can be absent or lie; we accumulate with a cap to prevent OOM / DoS.
+/// Exposed `pub` so integration tests can reference it.
+pub const MAX_RESP_BODY: usize = 64 * 1024 * 1024;
+
+/// Default connect timeout for the upstream reqwest client.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Default total (read) timeout for the upstream reqwest client.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -82,14 +95,39 @@ pub fn build_state(upstream: &str, capture_dir: Option<PathBuf>) -> anyhow::Resu
 }
 
 /// As [`build_state`], plus raw-payload recovery (tee) settings.
+/// Uses the default connect and read timeouts.
 pub fn build_state_with(
     upstream: &str,
     capture_dir: Option<PathBuf>,
     tee_mode: TeeMode,
     tee_dir: Option<PathBuf>,
 ) -> anyhow::Result<AppState> {
+    build_state_with_timeouts(
+        upstream,
+        capture_dir,
+        tee_mode,
+        tee_dir,
+        DEFAULT_CONNECT_TIMEOUT,
+        DEFAULT_READ_TIMEOUT,
+    )
+}
+
+/// As [`build_state_with`], but with explicit connect and read timeouts.
+/// Exposed so integration tests can lower the timeouts to verify timeout
+/// behaviour without actually waiting for the production defaults.
+pub fn build_state_with_timeouts(
+    upstream: &str,
+    capture_dir: Option<PathBuf>,
+    tee_mode: TeeMode,
+    tee_dir: Option<PathBuf>,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> anyhow::Result<AppState> {
     Ok(AppState {
-        client: Client::builder().build()?,
+        client: Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(read_timeout)
+            .build()?,
         upstream: upstream.trim_end_matches('/').to_string(),
         capture_dir,
         tee_mode,
@@ -200,17 +238,20 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
         .client
         .request(method.clone(), &url)
         .headers(req_headers)
-        .body(body_bytes.to_vec())
+        // PERF-1: Bytes is Clone (O(1) refcount bump); reqwest accepts it via
+        // Into<Body>, so no Vec copy is needed here.
+        .body(body_bytes.clone())
         .send()
         .await?;
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
+    // PERF-6: borrow &str from the already-owned HeaderMap; resp_headers
+    // outlives all uses of `ctype` in this function.
     let ctype = resp_headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
 
     // OAuth Protected Resource Metadata (RFC 9728). Upstream advertises its own
     // url as the `resource`, which Claude Code rejects because it dialed the
@@ -219,7 +260,8 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     // the OAuth dance still runs directly between Claude Code and api.figma.com
     // and the proxy never sees the token exchange.
     if method == Method::GET && path == "/.well-known/oauth-protected-resource" {
-        let bytes = upstream_resp.bytes().await?;
+        // SEC-1: cap the PRM body (it's tiny, but the cap applies uniformly).
+        let bytes = collect_capped(upstream_resp, MAX_RESP_BODY).await?;
         let out = rewrite_prm_resource(&bytes, self_origin);
         return Ok(buffered(status, &resp_headers, out));
     }
@@ -236,7 +278,8 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     // Everything else (the POST request/response exchange) is buffered. Tool
     // responses close the stream after the result, so buffering is safe and
     // makes transformation straightforward.
-    let bytes = upstream_resp.bytes().await?;
+    // SEC-1: accumulate with cap; Content-Length is advisory and can lie.
+    let bytes = collect_capped(upstream_resp, MAX_RESP_BODY).await?;
 
     // capture/tee write the WHOLE response body labelled by one tool. For a
     // batch with several target tools that's best-effort; pick deterministically
@@ -293,7 +336,9 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
         }
     }
 
-    Ok(buffered(status, &resp_headers, bytes.to_vec()))
+    // PERF-1: forward the upstream Bytes directly — Body::from(Bytes) is a
+    // zero-copy O(1) refcount bump; no Vec allocation on the pass-through path.
+    Ok(buffered_bytes(status, &resp_headers, bytes))
 }
 
 fn filter_req_headers(h: &HeaderMap) -> HeaderMap {
@@ -321,6 +366,38 @@ fn buffered(status: StatusCode, h: &HeaderMap, body: Vec<u8>) -> Response {
     apply_resp_headers(Response::builder().status(status), h)
         .body(Body::from(body))
         .unwrap()
+}
+
+/// Like [`buffered`] but accepts a `Bytes` value directly (PERF-1: O(1)
+/// refcount bump instead of a Vec allocation on the pass-through path).
+fn buffered_bytes(status: StatusCode, h: &HeaderMap, body: Bytes) -> Response {
+    apply_resp_headers(Response::builder().status(status), h)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Accumulate a reqwest response body with a hard cap on total bytes.
+///
+/// SEC-1: `Content-Length` is advisory — an upstream can omit it, lie about
+/// it, or send a large body without one. This function pulls chunks via
+/// `chunk()` and returns an error once the accumulated size exceeds `cap`,
+/// preventing OOM / DoS.
+async fn collect_capped(mut resp: reqwest::Response, cap: usize) -> anyhow::Result<Bytes> {
+    let hint = resp
+        .content_length()
+        .map(|n| (n as usize).min(cap))
+        .unwrap_or(0);
+    let mut buf: Vec<u8> = Vec::with_capacity(hint);
+
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > cap {
+            anyhow::bail!(
+                "upstream response body exceeded the {cap}-byte cap (possible DoS)"
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Load the global filter set, plus the project-local set in `./.figma-rtk/`
@@ -439,7 +516,21 @@ fn rewrite_www_authenticate(headers: &mut HeaderMap, self_origin: &str) {
 /// so the key embedded inside another param's quoted value is not mistaken for
 /// the param itself. Returns None when the key is absent or its value is
 /// unterminated.
+///
+/// Precondition: `new_val` must not contain a double-quote character.
+/// The caller derives `new_val` from an `is_safe_host`-screened origin (which
+/// already excludes quotes), so this is currently unreachable — the
+/// `debug_assert!` and `None` return guard against future callers that relax
+/// that invariant.
 fn replace_quoted_param(s: &str, key: &str, new_val: &str) -> Option<String> {
+    // SEC-3: Precondition — new_val must not contain a double-quote.
+    // No current exploit (caller derives new_val from an is_safe_host-screened
+    // origin which already excludes quotes); this guard is purely defensive
+    // against future callers that relax that invariant.
+    debug_assert!(!new_val.contains('"'), "new_val must not contain a double-quote");
+    if new_val.contains('"') {
+        return None;
+    }
     let needle = format!("{key}=\"");
     let mut from = 0;
     let key_start = loop {
@@ -508,6 +599,34 @@ mod tests {
     #[test]
     fn replace_quoted_param_absent_key_is_none() {
         assert!(replace_quoted_param(r#"scope="x""#, "resource_metadata", "y").is_none());
+    }
+
+    /// SEC-3 (release builds): a new_val containing a double-quote must be
+    /// rejected (returns None) so no unescaped quote can appear in the rewritten
+    /// header. Gated to release builds because in debug builds `debug_assert!`
+    /// fires before the `None` path is reached — that debug path is covered by
+    /// the `#[should_panic]` companion below, so both build modes are tested.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn replace_quoted_param_rejects_new_val_with_quote() {
+        let s = r#"Bearer resource_metadata="https://up/x",scope="mcp:connect""#;
+        // A new_val with an embedded quote must be rejected entirely.
+        let result = replace_quoted_param(s, "resource_metadata", r#"evil" injected="bad"#);
+        assert!(
+            result.is_none(),
+            "new_val with a quote must return None, not produce an injected header"
+        );
+    }
+
+    /// SEC-3 (debug builds): the precondition `debug_assert!` fires on a new_val
+    /// containing a quote, catching a future caller's programmer error loudly in
+    /// dev builds. The release-build `None`-return path is covered above.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "new_val must not contain a double-quote")]
+    fn replace_quoted_param_quote_panics_in_debug() {
+        let s = r#"Bearer resource_metadata="https://up/x",scope="mcp:connect""#;
+        let _ = replace_quoted_param(s, "resource_metadata", r#"evil" injected="bad"#);
     }
 
     #[test]
