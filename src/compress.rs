@@ -84,7 +84,13 @@ pub fn compress_result_with(
                         // re: Code Connect traceability / formatting — rendering is
                         // preserved; raw stays recoverable via tee/capture).
                         if ultra && crate::filter::matches_tool(tool, "get_design_context") {
-                            compress_jsx_code(&strip_figma_node_attrs(&c))
+                            if is_figma_node_tree(&c) {
+                                // Sparse node-tree dump (a section/frame's metadata,
+                                // not React): reduce each element to `<tag id="…">`.
+                                strip_node_tree_attrs(&c)
+                            } else {
+                                compress_jsx_code(&strip_figma_node_attrs(&c))
+                            }
                         } else {
                             c
                         }
@@ -273,6 +279,154 @@ fn compress_jsx_code(s: &str) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Detect get_design_context's sparse node-tree payload — a section/frame dump of
+/// `<tag id="N:M" name=… x=… y=… width=… height=…/>` elements — so it can be told
+/// apart from generated JSX (which `compress_jsx_code`/`strip_figma_node_attrs`
+/// handle). The discriminator is the Figma node-id form `id="N:M"` plus bare
+/// geometry attributes: real JSX/SVG carries `x=`/`width=` (inline SVG does) but
+/// its `id` — when present — is an author string (`icon`, `clip0`), never
+/// digits-colon-digits. Requiring `N:M` is what prevents a false positive that
+/// would route real code through `strip_node_tree_attrs` and gut it. The signature
+/// is matched anywhere in the payload (not just the first `>`), so a `>` inside the
+/// root element's `name` value cannot defeat detection.
+fn is_figma_node_tree(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with('<') && has_figma_id(t) && t.contains(" x=\"") && t.contains(" width=\"")
+}
+
+/// True if `s` carries a Figma node id — the first ` id="…"` whose value is `N:M`
+/// (one-or-more digits, a colon, then a digit). Generated JSX/SVG ids never take
+/// this shape, so it cleanly separates a node-tree from real code.
+fn has_figma_id(s: &str) -> bool {
+    let Some(pos) = s.find(" id=\"") else {
+        return false;
+    };
+    let val = &s[pos + 5..];
+    let Some(qend) = val.find('"') else {
+        return false;
+    };
+    let Some((a, b)) = val[..qend].split_once(':') else {
+        return false;
+    };
+    !a.is_empty()
+        && a.bytes().all(|c| c.is_ascii_digit())
+        && b.bytes().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Ultra-level only, get_design_context sparse node-tree. Reduces each element to
+/// `<tag id="N:M">` / `<tag id="N:M"/>`, dropping every other attribute (name, x,
+/// y, width, height, hidden, …). `id` is kept because the accompanying guidance
+/// block tells the agent to drill into sub-nodes *by id*; the tag name and nesting
+/// are kept so the structure survives. Quote-aware: an attribute value holding a
+/// `>` or an escaped quote never ends a tag early. Lossy (geometry/names gone),
+/// hence ultra-gated, with the raw payload recoverable via tee/capture. Byte-scan
+/// is UTF-8 safe — every slice index lands on an ASCII delimiter (`<>"=/`, space).
+fn strip_node_tree_attrs(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Inter-tag text (none in practice, but preserved if present).
+        if bytes[i] != b'<' {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'<' {
+                i += 1;
+            }
+            out.push_str(&s[start..i]);
+            continue;
+        }
+        // Closing tag `</…>`: copy verbatim.
+        if bytes.get(i + 1) == Some(&b'/') {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // include '>'
+            }
+            out.push_str(&s[start..i]);
+            continue;
+        }
+        // Opening / self-closing tag: read the tag name.
+        let name_start = i + 1;
+        let mut j = name_start;
+        while j < bytes.len()
+            && !bytes[j].is_ascii_whitespace()
+            && bytes[j] != b'>'
+            && bytes[j] != b'/'
+        {
+            j += 1;
+        }
+        let name = &s[name_start..j];
+        if name.is_empty() {
+            // Not a real tag (a stray '<', or '<' followed by a delimiter): keep the
+            // '<' verbatim rather than synthesising a spurious "<>" element.
+            out.push('<');
+            i += 1;
+            continue;
+        }
+        // Scan attributes (quote-aware): capture `id`, detect self-close, find end.
+        let mut id_val: Option<&str> = None;
+        let mut self_close = false;
+        let mut k = j;
+        loop {
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            match bytes.get(k) {
+                None => break,
+                Some(b'>') => {
+                    k += 1;
+                    break;
+                }
+                Some(b'/') => {
+                    if bytes.get(k + 1) == Some(&b'>') {
+                        self_close = true;
+                        k += 2;
+                        break;
+                    }
+                    k += 1; // stray slash
+                }
+                Some(_) => {
+                    let an_start = k;
+                    while k < bytes.len()
+                        && bytes[k] != b'='
+                        && bytes[k] != b'>'
+                        && !bytes[k].is_ascii_whitespace()
+                    {
+                        k += 1;
+                    }
+                    let attr = &s[an_start..k];
+                    if bytes.get(k) == Some(&b'=') && bytes.get(k + 1) == Some(&b'"') {
+                        let val_start = k + 2;
+                        match find_unescaped_quote(&s[val_start..]) {
+                            Some(rel) => {
+                                if attr == "id" {
+                                    id_val = Some(&s[val_start..val_start + rel]);
+                                }
+                                k = val_start + rel + 1;
+                            }
+                            None => k = bytes.len(), // malformed: stop
+                        }
+                    } else if an_start == k {
+                        k += 1; // made no progress: advance to avoid a stall
+                    }
+                }
+            }
+        }
+        out.push('<');
+        out.push_str(name);
+        if let Some(v) = id_val {
+            out.push_str(" id=\"");
+            out.push_str(v);
+            out.push('"');
+        }
+        out.push_str(if self_close { "/>" } else { ">" });
+        i = k;
+    }
+    out
 }
 
 /// Whether a line has an odd number of unescaped backticks (so it opens or closes
@@ -555,5 +709,109 @@ mod tests {
         let sv = compress_result(&mut v);
         assert!(sv.before > sv.after);
         assert_eq!(v["content"][0]["text"], Value::String("{\"x\":1}".into()));
+    }
+
+    #[test]
+    fn is_figma_node_tree_detects_nodetree_not_code() {
+        // Real sparse node-tree: detected via the id+geometry signature.
+        assert!(is_figma_node_tree(
+            r#"<section id="1:1" name="A" x="0" y="0" width="10" height="10"><text id="1:2" name="T" x="1" y="1" width="2" height="2" /></section>"#
+        ));
+        // Generated JSX (starts with const/export): not a node-tree.
+        assert!(!is_figma_node_tree(
+            "const a = \"u\";\nexport default function C() { return <div className=\"x\" />; }"
+        ));
+        // A bare HTML/JSX <section> uses className, no bare geometry: not a node-tree.
+        assert!(!is_figma_node_tree(
+            r#"<section className="hero"><p>hi</p></section>"#
+        ));
+        // JSX div with Figma data-attrs is not a node-tree (no bare x=/width=).
+        assert!(!is_figma_node_tree(
+            r#"<div className="c" data-node-id="1:2" data-name="H">hi</div>"#
+        ));
+    }
+
+    #[test]
+    fn strip_node_tree_attrs_keeps_id_and_tag_only() {
+        // Drops name/x/y/width/height/hidden; keeps id + tag + nesting + self-close.
+        // `name="A > B"` carries a '>' to prove the tag scan is quote-aware.
+        let nt = r#"<section id="1:1" name="Создание" x="-4080" y="-1260" width="6540" height="100"><text id="1:2" name="Title" x="57" y="321" width="246" height="22" /><frame id="1:3" name="A > B" x="0" y="0" width="1" height="1" hidden="true"><vector id="1:4" name="v" x="0" y="0" width="1" height="1" /></frame></section>"#;
+        let out = strip_node_tree_attrs(nt);
+        assert_eq!(
+            out,
+            r#"<section id="1:1"><text id="1:2"/><frame id="1:3"><vector id="1:4"/></frame></section>"#
+        );
+        // Invariant: never grows.
+        assert!(out.len() < nt.len());
+    }
+
+    #[test]
+    fn compress_result_with_strips_node_tree_only_at_ultra_for_gdc() {
+        let mk = || -> Value {
+            serde_json::from_str(
+                r#"{"content":[{"type":"text","text":"<section id=\"1:1\" name=\"A\" x=\"0\" y=\"0\" width=\"9\" height=\"9\"><text id=\"1:2\" name=\"T\" x=\"1\" y=\"1\" width=\"2\" height=\"2\" /></section>"}]}"#,
+            )
+            .unwrap()
+        };
+        let fs = FilterSet::default();
+
+        // Ultra + get_design_context: node-tree reduced to id + tag.
+        let mut u = mk();
+        let sv = compress_result_with(&mut u, "get_design_context", Level::Ultra, &fs);
+        assert_eq!(
+            u["content"][0]["text"].as_str().unwrap(),
+            r#"<section id="1:1"><text id="1:2"/></section>"#
+        );
+        assert!(sv.after < sv.before, "ultra reports savings");
+
+        // Aggressive: node-tree untouched (geometry survives).
+        let mut a = mk();
+        compress_result_with(&mut a, "get_design_context", Level::Aggressive, &fs);
+        assert!(
+            a["content"][0]["text"].as_str().unwrap().contains("width=\"9\""),
+            "aggressive keeps node-tree geometry"
+        );
+
+        // Ultra but a different tool: untouched (strip is gated to get_design_context).
+        let mut w = mk();
+        compress_result_with(&mut w, "get_metadata", Level::Ultra, &fs);
+        assert!(
+            w["content"][0]["text"].as_str().unwrap().contains("name=\"A\""),
+            "node-tree strip is gated to get_design_context"
+        );
+    }
+
+    #[test]
+    fn is_figma_node_tree_rejects_jsx_svg_with_geometry() {
+        // Review BLOCKER: an inline-SVG element carries id+x+width too, but its id is
+        // an author string, not Figma's "N:M". It must NOT be taken for a node-tree
+        // (else strip_node_tree_attrs would gut real code, dropping fill/className/…).
+        assert!(!is_figma_node_tree(
+            r#"<rect id="bg" x="0" y="0" width="100" height="50" fill="blue"/>"#
+        ));
+        assert!(!is_figma_node_tree(
+            r#"<svg id="icon" x="0" y="0" width="24" height="24" viewBox="0 0 24 24"><path d="M0 0h24"/></svg>"#
+        ));
+        // A genuine node-tree (N:M id) is still detected.
+        assert!(is_figma_node_tree(
+            r#"<frame id="10:20" name="x" x="0" y="0" width="1" height="1" />"#
+        ));
+    }
+
+    #[test]
+    fn is_figma_node_tree_detected_even_if_root_name_has_gt() {
+        // Finding 2: a '>' inside the root's name must not defeat detection.
+        assert!(is_figma_node_tree(
+            r#"<section id="1:1" name="A > B" x="0" y="0" width="9" height="9"><text id="1:2" /></section>"#
+        ));
+    }
+
+    #[test]
+    fn strip_node_tree_attrs_passes_through_trailing_lt() {
+        // Finding 3: a stray trailing '<' must pass through, not become "<>".
+        assert_eq!(
+            strip_node_tree_attrs(r#"<frame id="1:1"/><"#),
+            r#"<frame id="1:1"/><"#
+        );
     }
 }
