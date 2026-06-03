@@ -123,10 +123,20 @@ impl FilterSet {
     /// field as JSON: `apply_structural` operates on the result envelope itself,
     /// so a `get_design_context` filter can drop whole `content[]` boilerplate
     /// blocks (whose text is React code, not JSON) and the `_meta` key.
-    pub fn apply_structural(&self, tool: &str, v: &mut Value) {
-        for f in self.for_tool(tool) {
+    /// Apply every filter matching `tool` to `v` structurally. Returns `true`
+    /// if any filter changed the value (a key was dropped, an array element was
+    /// removed, or a depth-truncation was applied).
+    pub fn apply_structural(&self, tool: &str, v: &mut Value) -> bool {
+        let matched = self.for_tool(tool);
+        if matched.is_empty() {
+            return false;
+        }
+        let before = serde_json::to_string(v).unwrap_or_default();
+        for f in matched {
             apply_value(v, f, 0);
         }
+        let after = serde_json::to_string(v).unwrap_or_default();
+        before != after
     }
 
     pub fn apply_text(&self, tool: &str, text: &str) -> Option<String> {

@@ -17,6 +17,10 @@ use crate::filter::FilterSet;
 pub struct Savings {
     pub before: usize,
     pub after: usize,
+    /// True when `apply_structural` or `apply_text` mutated the value (e.g.
+    /// dropped `_meta` or a boilerplate block), even if `content[].text`
+    /// byte lengths happen to be unchanged (e.g. non-text content blocks only).
+    pub mutated: bool,
 }
 
 impl Savings {
@@ -24,10 +28,12 @@ impl Savings {
         Self {
             before,
             after: after.min(before),
+            mutated: false,
         }
     }
+    /// True when compression actually reduced content bytes.
     pub fn any(&self) -> bool {
-        self.before > 0
+        self.after < self.before
     }
 }
 
@@ -56,10 +62,13 @@ pub fn compress_result_with(
     // structure — this can drop whole `content[]` blocks (e.g. get_design_context
     // boilerplate, whose text is React code, not JSON) and keys like `_meta`. The
     // per-item pass below then compresses whatever text blocks survive.
-    if aggressive {
-        filters.apply_structural(tool, result);
-    }
+    let structural_mutated = if aggressive {
+        filters.apply_structural(tool, result)
+    } else {
+        false
+    };
 
+    let mut text_mutated = false;
     if let Some(content) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
         for item in content {
             if item.get("type").and_then(|t| t.as_str()) != Some("text") {
@@ -72,9 +81,16 @@ pub fn compress_result_with(
             // strips fields inside it; otherwise fall back to the whitespace pass.
             // At ultra, a non-JSON code block additionally has its Figma-reference
             // attributes (data-node-id / data-name) stripped — lossy, recoverable.
+            // Track whether this block's compressed value came from apply_text
+            // (a semantic filter), so we can set text_mutated only when the
+            // filtered result is actually written back (length guard below).
+            let mut from_filter = false;
             let compressed = if aggressive {
                 match filters.apply_text(tool, text) {
-                    Some(filtered) => filtered,
+                    Some(filtered) => {
+                        from_filter = true;
+                        filtered
+                    }
                     None => {
                         let c = compress_text(text);
                         // These transforms only make sense for get_design_context's
@@ -101,12 +117,28 @@ pub fn compress_result_with(
             };
             if compressed.len() < text.len() {
                 item["text"] = Value::String(compressed);
+                // apply_text ran a filter and the filtered result was actually
+                // written back. Only set text_mutated here, inside the length guard,
+                // so the flag reflects a real change to the forwarded bytes.
+                if from_filter {
+                    text_mutated = true;
+                }
             }
         }
     }
 
     let after = crate::cache::content_text_len(result);
-    Savings::new(before, after)
+    let mut sv = Savings::new(before, after);
+    // A structural filter may have mutated the envelope (dropped _meta, a whole
+    // content block, etc.) even when before==0 (no text content) or the text byte
+    // count did not decrease. A text filter (apply_text) similarly rewrites a
+    // content[].text field even if the output happens to be the same byte length.
+    // Track both separately so the caller can still emit a StatRec and forward
+    // the mutated bytes.
+    if structural_mutated || text_mutated {
+        sv.mutated = true;
+    }
+    sv
 }
 
 /// Whitespace-only convenience wrapper over [`compress_payload`].

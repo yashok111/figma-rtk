@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tokens;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StatRec {
     pub tool: String,
     pub before: usize,
