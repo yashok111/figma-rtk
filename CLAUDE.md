@@ -13,8 +13,9 @@ Claude Code  ──►  frtk (localhost:7337)  ──►  https://mcp.figma.com/
 ```
 
 The Figma MCP server is remote HTTP, **not** a stdio command — so this is a proxy,
-not a CLI wrapper. `README.md` covers user-facing usage; `HANDOFF.md` holds the
-detailed running state and the working flow. Read both before non-trivial work.
+not a CLI wrapper. `README.md` covers user-facing usage; the project memory
+(`~/.claude/projects/-home-yakov-projects-claude-figma/memory/figma-rtk-project.md`)
+holds the detailed running state and phase history. Read both before non-trivial work.
 
 ## Build / test / run
 
@@ -86,8 +87,11 @@ Hermetic test env overrides (used by tests so they don't touch real state):
 
 - **Strict TDD.** Write/adjust the test, see it fail, implement, green. Every
   feature has unit tests; the proxy has the mock-upstream integration test.
-- **Not a git repo.** No `origin`. Do **not** `git init` / commit / push without an
-  explicit user command.
+- **Git repo since 2026-06-03** (branch `main`, no remote/`origin` yet). Do **not**
+  commit or push without an explicit user command. Per the user's flow, do feature
+  work on `feat/<name>` branches, never commit feature work straight to `main`.
+  `target/` and the transient `fixtures/get_design_context-[0-9]*.json` capture dumps
+  are gitignored; the `*-sample.json` fixtures are the committed TDD ground truth.
 - **Tool-name matching uses a `__` boundary**, never loose `ends_with` (both
   `mcp::is_target` and `filter::matches_tool`) — so `metadata` does not match
   `set_metadata`.
@@ -98,6 +102,8 @@ Hermetic test env overrides (used by tests so they don't touch real state):
   claude.ai account connector (**unproxied** — bypasses frtk), while
   `mcp__plugin_figma_figma__*` is the plugin server that `frtk init` repoints at the
   proxy. Any capture / proxied read MUST use the **plugin** server.
-- The user works in **Waves** and reviews each via two parallel `cavecrew-reviewer`
-  subagents (different vectors, e.g. correctness + data-integrity) before it's done.
-  See `HANDOFF.md §6`.
+- The user works in **Waves**: plan → implement (inline TDD, or parallel
+  `cavecrew-builder` for independent tasks) → **two-factor review** (two parallel
+  `cavecrew-reviewer` subagents, different vectors e.g. correctness + data-integrity;
+  a blocker from either loops the wave) → Telegram report per wave. No commits/pushes
+  without an explicit command.
