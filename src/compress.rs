@@ -77,11 +77,14 @@ pub fn compress_result_with(
                     Some(filtered) => filtered,
                     None => {
                         let c = compress_text(text);
-                        // The node-attr strip only makes sense for get_design_context's
-                        // generated JSX; gate it to that tool so a use_figma return that
-                        // happens to be a raw HTML/JSX string is never touched.
+                        // These transforms only make sense for get_design_context's
+                        // generated JSX; gate them to that tool so a use_figma return
+                        // that happens to be a raw HTML/JSX string is never touched.
+                        // Strip Figma-ref attrs, then dedent the JSX (both lossy only
+                        // re: Code Connect traceability / formatting — rendering is
+                        // preserved; raw stays recoverable via tee/capture).
                         if ultra && crate::filter::matches_tool(tool, "get_design_context") {
-                            strip_figma_node_attrs(&c)
+                            compress_jsx_code(&strip_figma_node_attrs(&c))
                         } else {
                             c
                         }
@@ -245,6 +248,53 @@ fn strip_figma_node_attrs(s: &str) -> String {
     out
 }
 
+/// Ultra-level only, get_design_context JSX. Removes the pretty-printer's leading
+/// indentation from each line — rendering-insignificant for JSX/JS (it only changes
+/// formatting, never the rendered output or any token/attribute/text). Lines inside
+/// an open backtick template literal are left verbatim, because leading whitespace
+/// there IS part of the string value. Only leading whitespace is ever removed, so
+/// stripping all whitespace from the input and output yields identical strings.
+///
+/// On a template's *opening* line the guard is still false at trim time, but that
+/// is correct: a line's leading whitespace is always code indentation *before* the
+/// first backtick — the template value only begins at/after the backtick, which
+/// `trim_start` (leading-only) never reaches. The guard can be mis-toggled by a
+/// stray backtick in a double-quoted string or comment, but only ever toward
+/// OVER-keeping indentation (a real template cannot contain an unescaped backtick —
+/// it would close the template), so the failure direction is safe (less savings),
+/// never corruption.
+fn compress_jsx_code(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_template = false;
+    for line in s.lines() {
+        out.push(if in_template { line } else { line.trim_start() });
+        if has_odd_unescaped_backticks(line) {
+            in_template = !in_template;
+        }
+    }
+    out.join("\n")
+}
+
+/// Whether a line has an odd number of unescaped backticks (so it opens or closes
+/// a multiline template literal). Byte-scan is UTF-8 safe: `` ` `` (0x60) and `\`
+/// (0x5C) are ASCII and never occur as multibyte continuation bytes.
+fn has_odd_unescaped_backticks(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // skip the escaped char (e.g. \`)
+            b'`' => {
+                count += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    count % 2 == 1
+}
+
 /// Byte offset of the first `"` not preceded by a backslash escape, so an
 /// attribute value containing an escaped quote (`\"`) is not truncated early.
 /// Byte-scanning is UTF-8 safe here: `"` (0x22) and `\` (0x5C) are ASCII and
@@ -333,6 +383,61 @@ mod tests {
             r#"<div className="x"><p>Привет</p></div>"#,
             "node-id + data-name removed (incl. leading space), unicode content kept"
         );
+    }
+
+    /// Whitespace-only invariant: removing ALL whitespace from input and output
+    /// must give identical strings — proves the transform touched only whitespace.
+    fn ws_stripped(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn compress_jsx_code_dedents_preserves_content_and_template() {
+        let code = "function H() {\n  return (\n    <div className=\"a b\">\n      <p>Привет — мир</p>\n      <p>{`keep  these  spaces`}</p>\n    </div>\n  );\n}";
+        let out = compress_jsx_code(code);
+        // leading indentation removed
+        assert!(out.contains("\n<div className=\"a b\">"), "div dedented");
+        assert!(out.contains("\n<p>Привет — мир</p>"), "text line dedented, content intact");
+        // significant template spaces preserved verbatim
+        assert!(out.contains("{`keep  these  spaces`}"), "template spaces preserved");
+        // INVARIANT: only whitespace was touched
+        assert_eq!(ws_stripped(code), ws_stripped(&out), "no non-whitespace changed");
+        assert!(out.len() < code.len(), "smaller");
+    }
+
+    #[test]
+    fn compress_jsx_code_preserves_multiline_template_indentation() {
+        // A backtick template spanning lines: its inner indentation is significant
+        // and must NOT be stripped.
+        let code = "const x = `\n    indented inside template\n`;\n<div>\n  <p>hi</p>\n</div>";
+        let out = compress_jsx_code(code);
+        assert!(out.contains("\n    indented inside template\n"), "template indent kept");
+        assert!(out.contains("\n<div>"), "non-template indent stripped");
+        assert_eq!(ws_stripped(code), ws_stripped(&out));
+    }
+
+    #[test]
+    fn compress_jsx_code_opening_template_line_keeps_value_spaces_drops_code_indent() {
+        // The opening line is indented (code) AND the template value begins with
+        // spaces right after the backtick. trim_start must drop the code indent but
+        // never the post-backtick value spaces (they are not "leading").
+        let code = "    const t = `  value spaces\n      more`;\n    return t;";
+        let out = compress_jsx_code(code);
+        assert!(
+            out.starts_with("const t = `  value spaces"),
+            "code indent dropped, post-backtick value spaces kept: {out:?}"
+        );
+        assert!(out.contains("\n      more`;"), "template-interior line verbatim");
+        assert!(out.contains("\nreturn t;"), "trailing code dedented");
+    }
+
+    #[test]
+    fn has_odd_unescaped_backticks_counts_correctly() {
+        assert!(has_odd_unescaped_backticks("const x = `"));
+        assert!(!has_odd_unescaped_backticks("const x = `y`;"));
+        assert!(!has_odd_unescaped_backticks(r"a \` b"), "escaped backtick not counted");
+        assert!(has_odd_unescaped_backticks("`"));
+        assert!(!has_odd_unescaped_backticks("no ticks here"));
     }
 
     #[test]
