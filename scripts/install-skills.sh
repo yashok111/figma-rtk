@@ -309,11 +309,28 @@ run() {
   fi
 }
 
+# Which agent dir to install into. Override via env:
+#   SKILLS_AGENT=universal  (default) -> <repo>/.agents/skills/   (AGENTS.md convention)
+#   SKILLS_AGENT=auto                 -> let the CLI auto-detect the running agent
+#                                        (inside Claude Code -> project .claude/skills/)
+#   SKILLS_AGENT=<name>               -> pass through to `skills add -a <name>`
+SKILLS_AGENT="${SKILLS_AGENT:-universal}"
+FAILED=()
+
 # install_set <repo_url> <skill> [skill ...]
 # Installs one or more skills from the given repo via the skills CLI.
+# A single repo failure is recorded (FAILED) but does NOT abort the run, so
+# one flaky/network-failed repo can't skip the other groups under `set -e`.
 install_set() {
   local repo="$1"; shift
-  run npx -y -p skills skills add "$repo" -y -a universal --skill "$@"
+  local rc=0
+  if [[ "$SKILLS_AGENT" == "auto" ]]; then
+    run npx -y -p skills skills add "$repo" -y --skill "$@" || rc=$?
+  else
+    run npx -y -p skills skills add "$repo" -y -a "$SKILLS_AGENT" --skill "$@" || rc=$?
+  fi
+  [[ $rc -ne 0 ]] && { echo "  WARN: install failed (rc=$rc): $repo"; FAILED+=("$repo"); }
+  return 0
 }
 
 # ── cd to repo root ────────────────────────────────────────────────────────────
@@ -502,4 +519,8 @@ for group in "${DEDUPED[@]}"; do
 done
 
 echo ""
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+  echo "Completed with ${#FAILED[@]} failed repo(s):"
+  printf '  - %s\n' "${FAILED[@]}"
+fi
 echo "Done. Re-start Claude Code (or /mcp refresh) to pick up new skills."
