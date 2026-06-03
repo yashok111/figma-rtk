@@ -11,7 +11,6 @@ use axum::routing::any;
 use axum::Router;
 use reqwest::Client;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cache::DeltaCache;
@@ -59,7 +58,6 @@ pub struct AppState {
     filters: Arc<FilterSet>,
     /// Opt-in delta cache (None = disabled).
     delta_cache: Option<Arc<DeltaCache>>,
-    seq: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -99,7 +97,6 @@ pub fn build_state_with(
         level: Level::Standard,
         filters: Arc::new(FilterSet::default()),
         delta_cache: None,
-        seq: Arc::new(AtomicU64::new(0)),
     })
 }
 
@@ -250,8 +247,7 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     // Optional fixture capture: dump the raw target response body (no headers,
     // no token) so phase-2 compression can be developed against real payloads.
     if let (Some(dir), Some(tool)) = (&st.capture_dir, label_tool) {
-        let n = st.seq.fetch_add(1, Ordering::Relaxed);
-        match crate::capture::save(dir, tool, n, &bytes) {
+        match crate::capture::save_next(dir, tool, &bytes) {
             Ok(path) => tracing::info!("captured {tool} fixture -> {}", path.display()),
             Err(e) => tracing::warn!("capture failed: {e}"),
         }
