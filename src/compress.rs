@@ -200,55 +200,92 @@ pub fn compress_text(s: &str) -> String {
 /// Drop whitespace runs that sit fully between `>` and `<` and contain a
 /// newline (i.e. pretty-printer indentation). Single intra-line spaces and any
 /// run holding real text content are left untouched.
+///
+/// UTF-8 safe: the delimiters (`>`, `<`, `\n`, `\r`, space, tab) are all
+/// single-byte ASCII codepoints and never appear as continuation bytes of a
+/// multibyte sequence, so per-byte matching cannot split a multibyte character.
+/// The only bytes we skip are confirmed whitespace ASCII bytes; the only bytes
+/// we copy are exact byte-index slices of the original `&str`, so multibyte
+/// content (e.g. Cyrillic, CJK) is always copied whole-codepoint.
 fn strip_xml_indent(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
+    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        out.push(c);
-        if c == '>' {
-            let mut j = i + 1;
-            let mut saw_newline = false;
-            while j < chars.len() && chars[j].is_whitespace() {
-                if chars[j] == '\n' || chars[j] == '\r' {
-                    saw_newline = true;
-                }
-                j += 1;
-            }
-            if saw_newline && j < chars.len() && chars[j] == '<' && j > i + 1 {
-                // Skip the whitespace run entirely.
-                i = j;
-                continue;
-            }
+    while i < bytes.len() {
+        // Copy up to and including the next `>` (or end of input).
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'>' {
+            i += 1;
         }
-        i += 1;
+        if i >= bytes.len() {
+            // No more `>` — copy the remainder and we're done.
+            out.push_str(&s[start..]);
+            break;
+        }
+        // Include the `>` itself.
+        i += 1; // now i points one past the `>`
+        out.push_str(&s[start..i]);
+
+        // Scan the whitespace run after `>`.
+        let ws_start = i;
+        let mut saw_newline = false;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            if bytes[i] == b'\n' || bytes[i] == b'\r' {
+                saw_newline = true;
+            }
+            i += 1;
+        }
+        // Drop the whitespace iff it contained a newline AND the run ends at `<`.
+        // If not, write it back verbatim.
+        if saw_newline && i < bytes.len() && bytes[i] == b'<' && i > ws_start {
+            // Skip — the whitespace run is pure indentation; continue from `<`.
+        } else {
+            out.push_str(&s[ws_start..i]);
+        }
     }
     out
 }
 
 fn collapse_code_ws(s: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
+    // Write directly into an output String, skipping leading blank lines until
+    // the first non-blank one. Blank runs of >1 are collapsed to a single blank.
+    // Trailing blank lines are omitted. No per-line heap allocation, no Vec, no
+    // O(n) remove(0) for the leading-blank strip.
+    let mut out = String::with_capacity(s.len());
     let mut blank_run = 0u32;
+    let mut started = false; // true once the first non-blank line has been written
+
     for raw in s.lines() {
         let line = raw.trim_end();
         if line.is_empty() {
-            blank_run += 1;
-            if blank_run <= 1 {
-                out.push(String::new());
+            if started {
+                blank_run += 1;
+                if blank_run == 1 {
+                    // Tentatively push a blank separator; it may be trailing and
+                    // will be trimmed below if no further content line follows.
+                    out.push('\n');
+                }
             }
+            // Before the first content line: skip (strip leading blanks).
         } else {
+            started = true;
             blank_run = 0;
-            out.push(line.to_string());
+            // If a blank separator was already pushed (blank_run==1 path above),
+            // the '\n' delimiter we push below comes immediately after it, giving
+            // the canonical "\n\n" (one blank line). If this is the very first
+            // content line, `out` is empty and we skip the leading newline.
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
         }
     }
-    while out.first().is_some_and(|l| l.is_empty()) {
-        out.remove(0);
-    }
-    while out.last().is_some_and(|l| l.is_empty()) {
+    // Strip any trailing blank lines: `out` ends with '\n' only when the last
+    // pushed item was a blank separator (blank_run >= 1 path). Trim those.
+    while out.ends_with('\n') {
         out.pop();
     }
-    out.join("\n")
+    out
 }
 
 /// Ultra-level only. Remove Figma reference attributes (`data-node-id`,
@@ -521,10 +558,65 @@ mod tests {
     }
 
     #[test]
+    fn xml_strip_indent_multibyte_content_preserved() {
+        // Cyrillic characters are multibyte (2 bytes each in UTF-8). The byte scan
+        // must not split them, and content inside elements must be preserved verbatim.
+        let xml = "<root>\n    <item>Привет мир</item>\n    <item>Москва</item>\n</root>";
+        let out = compress_text(xml);
+        assert_eq!(
+            out,
+            "<root><item>Привет мир</item><item>Москва</item></root>",
+            "Cyrillic content must survive XML indent stripping intact"
+        );
+        // Each Cyrillic char should still be readable as valid UTF-8
+        assert!(out.is_ascii() || out.chars().all(|c| c != char::REPLACEMENT_CHARACTER),
+            "no replacement characters (no char splits)");
+    }
+
+    #[test]
     fn code_blank_runs_collapse() {
         let code = "const a = 1;   \n\n\n\nconst b = 2;\n";
         let out = compress_text(code);
         assert_eq!(out, "const a = 1;\n\nconst b = 2;");
+    }
+
+    #[test]
+    fn code_collapse_all_blank() {
+        // An entirely-blank input (or all whitespace) should produce an empty string.
+        assert_eq!(collapse_code_ws(""), "");
+        assert_eq!(collapse_code_ws("   \n   \n   "), "");
+        assert_eq!(collapse_code_ws("\n\n\n"), "");
+    }
+
+    #[test]
+    fn code_collapse_leading_blanks_stripped() {
+        // Leading blank lines are stripped; content lines are preserved.
+        let code = "\n\n\nconst x = 1;";
+        let out = collapse_code_ws(code);
+        assert_eq!(out, "const x = 1;");
+    }
+
+    #[test]
+    fn code_collapse_trailing_blanks_stripped() {
+        // Trailing blank lines are stripped.
+        let code = "const x = 1;\n\n\n";
+        let out = collapse_code_ws(code);
+        assert_eq!(out, "const x = 1;");
+    }
+
+    #[test]
+    fn code_collapse_many_leading_blanks() {
+        // Many leading blanks (>1) are all removed; interior blank runs collapse to 1.
+        let code = "\n\n\n\n\nconst a = 1;\n\n\nconst b = 2;\n\n";
+        let out = collapse_code_ws(code);
+        assert_eq!(out, "const a = 1;\n\nconst b = 2;");
+    }
+
+    #[test]
+    fn code_collapse_single_line_trailing_spaces() {
+        // A single content line with trailing spaces: spaces stripped, no trailing newline.
+        assert_eq!(collapse_code_ws("hello   "), "hello");
+        assert_eq!(collapse_code_ws("  hello  "), "  hello"); // leading preserved, trailing stripped
     }
 
     #[test]

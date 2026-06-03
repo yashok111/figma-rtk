@@ -88,8 +88,24 @@ impl FilterSet {
     }
 
     /// Parse filters from a TOML string.
+    ///
+    /// Returns `Err` if any filter carries `max_depth = 0`: depth 0 means the
+    /// root envelope itself, so it would replace the entire result with `"…"`,
+    /// nuking every content block. The minimum safe value is 1 (keeps top-level
+    /// keys, truncates nested objects). Use `max_depth = 1` if you mean "keep
+    /// only top-level keys".
     pub fn parse(s: &str) -> anyhow::Result<FilterSet> {
         let ff: FilterFile = toml::from_str(s)?;
+        for f in &ff.filters {
+            if f.max_depth == Some(0) {
+                anyhow::bail!(
+                    "filter {:?}: max_depth=0 is invalid — it would replace the \
+                     entire result envelope with \"…\". Use max_depth=1 to keep \
+                     only top-level keys.",
+                    f.name
+                );
+            }
+        }
         Ok(FilterSet { filters: ff.filters })
     }
 
@@ -113,9 +129,6 @@ impl FilterSet {
             .collect()
     }
 
-    /// Apply every filter matching `tool` to `text` (must be JSON). Returns the
-    /// transformed, minified JSON, or `None` if no filter matched or the text
-    /// is not JSON (caller then falls back to whitespace-only compression).
     /// Apply every filter matching `tool` to a JSON value in place, structurally
     /// — dropping whole array elements (`drop_where`), object keys (`drop_keys`),
     /// and truncating depth (`max_depth`) over the value's own structure. This is
@@ -123,9 +136,8 @@ impl FilterSet {
     /// field as JSON: `apply_structural` operates on the result envelope itself,
     /// so a `get_design_context` filter can drop whole `content[]` boilerplate
     /// blocks (whose text is React code, not JSON) and the `_meta` key.
-    /// Apply every filter matching `tool` to `v` structurally. Returns `true`
-    /// if any filter changed the value (a key was dropped, an array element was
-    /// removed, or a depth-truncation was applied).
+    /// Returns `true` if any filter changed the value (a key was dropped, an array
+    /// element was removed, or a depth-truncation was applied).
     pub fn apply_structural(&self, tool: &str, v: &mut Value) -> bool {
         let matched = self.for_tool(tool);
         if matched.is_empty() {
@@ -139,6 +151,9 @@ impl FilterSet {
         before != after
     }
 
+    /// Apply every filter matching `tool` to `text` (must be JSON). Returns the
+    /// transformed, minified JSON, or `None` if no filter matched or the text
+    /// is not JSON (caller then falls back to whitespace-only compression).
     pub fn apply_text(&self, tool: &str, text: &str) -> Option<String> {
         let matched = self.for_tool(tool);
         if matched.is_empty() {
@@ -188,10 +203,13 @@ fn matches_drop_where(el: &Value, f: &Filter) -> bool {
 }
 
 /// Recursively apply one filter's rules to a JSON value, in place.
-pub fn apply_value(v: &mut Value, f: &Filter, depth: usize) {
+pub(crate) fn apply_value(v: &mut Value, f: &Filter, depth: usize) {
     if let Some(md) = f.max_depth {
         // Root is depth 0; objects/arrays at depth >= max_depth are truncated.
-        if depth >= md {
+        // Clamp: depth 0 with max_depth=0 would replace the root envelope —
+        // guard so the root is never silently nuked even if parse() is bypassed.
+        let effective_md = md.max(1);
+        if depth >= effective_md {
             *v = Value::String("…".to_string());
             return;
         }
@@ -431,6 +449,48 @@ mod tests {
         let mut v2: Value = serde_json::from_str(r#"{"_meta":{"x":1},"content":[]}"#).unwrap();
         fs.apply_structural("whoami", &mut v2);
         assert_eq!(v2, serde_json::json!({"_meta":{"x":1},"content":[]}));
+    }
+
+    #[test]
+    fn max_depth_zero_is_rejected_at_parse_time() {
+        // max_depth=0 would replace the root envelope with "…", nuking the whole
+        // result. parse() must reject it outright.
+        let err = FilterSet::parse(
+            "[[filter]]\nname=\"x\"\ntools=[\"t\"]\nmax_depth=0\n",
+        );
+        assert!(err.is_err(), "max_depth=0 must be rejected at parse time");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("max_depth") || msg.contains("0"),
+            "error should mention max_depth or 0, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn max_depth_zero_root_envelope_not_replaced_by_apply_value() {
+        // Even if a filter with max_depth=0 somehow reached apply_value (it won't
+        // after parse-time guard), apply_value must clamp to 1 so the root object
+        // itself is never replaced with "…". The root envelope is preserved; only
+        // nested children can be truncated (at depth >= 1, which is effective_md).
+        //
+        // Because parse() now rejects max_depth=0, we build the Filter manually
+        // (bypassing parse) to test the apply_value guard in isolation.
+        let f = Filter {
+            name: "x".into(),
+            tools: vec!["t".into()],
+            drop_keys: vec![],
+            drop_where: vec![],
+            max_depth: Some(0),
+            tests: vec![],
+        };
+        let mut v: Value = serde_json::from_str(r#"{"keep":"alive"}"#).unwrap();
+        apply_value(&mut v, &f, 0);
+        // The root object itself must NOT be replaced with "…".
+        // (Without the clamp, max_depth=0 causes depth 0 >= 0 → root becomes "…".)
+        assert!(
+            v.is_object(),
+            "apply_value with max_depth=0 must not replace the root object with '…'; got: {v}"
+        );
     }
 
     #[test]
