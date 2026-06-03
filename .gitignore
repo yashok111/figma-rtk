@@ -5,3 +5,7 @@
 # transient (overwritten from index 0000 on each serve restart). The curated
 # *-sample.json fixtures are committed as the TDD ground truth instead.
 /fixtures/get_design_context-[0-9]*.json
+
+# Third-party skills installed by scripts/install-skills.sh into .agents/skills/
+# (vendored from upstream repos, re-creatable from the script — not committed).
+/.agents/skills/
