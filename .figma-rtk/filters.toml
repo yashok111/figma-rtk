@@ -1,0 +1,37 @@
+# Project-local frtk filters for the Figma MCP server.
+# Applied only at --level aggressive / ultra, and only after this directory is
+# trusted (`frtk trust`). The full raw payload stays recoverable via `tee`.
+# Validate logic with `frtk verify` (runs the inline [[filter.tests]] below).
+
+[[filter]]
+name = "design-context-lean"
+tools = ["get_design_context"]
+
+# Figma stamps a per-request id under result._meta — pure request-tracking
+# noise the agent never needs.
+drop_keys = ["_meta"]
+
+# get_design_context returns several `content[]` text blocks: the actual
+# React/Tailwind code (the value) plus constant instruction blocks Figma
+# appends to EVERY response. Drop the three boilerplate instruction blocks,
+# matched on each one's stable leading phrase. The match is ANCHORED at the
+# start (starts_with), so the code block — which begins with `const …` /
+# `import …` / `export …` — is never touched even if it mentions these words
+# mid-string. The "These styles are contained in the design: …Font(…)" block
+# carries real design tokens and is intentionally KEPT.
+drop_where = [
+  { key = "text", starts_with = "SUPER CRITICAL" },
+  { key = "text", starts_with = "Node ids have been added" },
+  { key = "text", starts_with = "Images and SVGs will be stored" },
+]
+
+[[filter.tests]]
+name = "drops the three boilerplate blocks + _meta, keeps code and design tokens"
+input = '''{"_meta":{"mcpRequestId":"abc"},"content":[{"type":"text","text":"export default function Hero() { return null; }"},{"type":"text","text":"SUPER CRITICAL: The generated React+Tailwind code MUST be converted to match the target project's stack."},{"type":"text","text":"Node ids have been added to the code as data attributes, e.g. data-node-id."},{"type":"text","text":"These styles are contained in the design: display/sub: Font(family: Unbounded, size: 32, weight: 700)."},{"type":"text","text":"Images and SVGs will be stored as constants, e.g. const image = url."}]}'''
+absent = ["SUPER CRITICAL", "Node ids have been added", "Images and SVGs will be stored", "mcpRequestId"]
+present = ["export default function Hero", "These styles are contained", "Font(family: Unbounded"]
+
+[[filter.tests]]
+name = "anchored prefix does not drop a code block that merely mentions the words mid-string"
+input = '''{"content":[{"type":"text","text":"const note = 1; // Images and SVGs will be stored remotely; this is SUPER CRITICAL to render"}]}'''
+present = ["const note = 1"]
