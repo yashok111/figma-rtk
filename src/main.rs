@@ -6,8 +6,9 @@
 //! and transparently compresses the responses of the heavy read tools
 //! (get_design_context / get_metadata) before they reach the agent.
 
-use clap::{Parser, Subcommand};
-use figma_rtk::{compress, config, filter, init, proxy, stats, tokens, trust};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
+use figma_rtk::{compress, config, filter, init, proxy, stats, status, tokens, trust};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -39,6 +40,19 @@ enum Cmd {
         /// List the most recent compressed calls instead of just totals.
         #[arg(long)]
         history: bool,
+        /// Limit display to records within the given window (e.g. 90s, 30m, 1h, 1d).
+        /// Suffix must be one of: s m h d.
+        #[arg(long, value_name = "DUR")]
+        since: Option<String>,
+        /// Refresh every ~2 seconds (clear screen + reprint until Ctrl-C).
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Print shell completions for the given shell to stdout.
+    Completions {
+        /// Target shell (bash, zsh, fish, elvish, powershell).
+        #[arg(value_enum)]
+        shell: Shell,
     },
     /// Print the Claude Code MCP config snippet, or create a config file.
     Config {
@@ -100,6 +114,16 @@ enum Cmd {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Check that the proxy is running, .mcp.json is wired, and OAuth discovery
+    /// is fresh. Exits nonzero if any check fails.
+    Status {
+        /// Proxy port to probe.
+        #[arg(long, default_value_t = 7337)]
+        port: u16,
+        /// Emit results as a JSON object instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -115,7 +139,23 @@ async fn main() -> anyhow::Result<()> {
                 .init();
             proxy::serve(&host, port, &upstream, capture_dir, level).await
         }
-        Cmd::Gain { history } => stats::print_gain(history),
+        Cmd::Gain { history, since, watch } => {
+            let since_secs: Option<u64> =
+                since.as_deref().map(stats::parse_duration).transpose()?;
+            if watch {
+                loop {
+                    // Clear screen (ANSI escape or cls equivalent).
+                    print!("\x1B[2J\x1B[H");
+                    stats::print_gain(history, since_secs)?;
+                    // tokio::time::sleep (not std::thread::sleep) so we yield the
+                    // executor thread instead of blocking the async runtime.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            } else {
+                stats::print_gain(history, since_secs)?;
+            }
+            Ok(())
+        }
         Cmd::Config { host, port, create } => {
             if create {
                 let path = config::create()?;
@@ -152,6 +192,12 @@ async fn main() -> anyhow::Result<()> {
             println!("untrusted {}", dir.display());
             Ok(())
         }
+        Cmd::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "frtk", &mut std::io::stdout());
+            Ok(())
+        }
+        Cmd::Status { port, json } => run_status(port, json).await,
     }
 }
 
@@ -218,6 +264,31 @@ fn run_init(file: Option<PathBuf>, port: u16, uninstall: bool) -> anyhow::Result
             file.display(),
             file.display()
         );
+    }
+    Ok(())
+}
+
+async fn run_status(port: u16, json_mode: bool) -> anyhow::Result<()> {
+    let checks = status::run_checks(port).await;
+
+    if json_mode {
+        // Build a small JSON object: {proxy_up, mcp_wired, oauth_fresh}
+        let obj = serde_json::json!({
+            checks[0].label: checks[0].ok,
+            checks[1].label: checks[1].ok,
+            checks[2].label: checks[2].ok,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        for c in &checks {
+            let flag = if c.ok { "[ok]  " } else { "[FAIL]" };
+            println!("{flag} {} — {}", c.label, c.detail);
+        }
+    }
+
+    let all_ok = checks.iter().all(|c| c.ok);
+    if !all_ok {
+        std::process::exit(1);
     }
     Ok(())
 }

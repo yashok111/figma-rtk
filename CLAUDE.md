@@ -94,7 +94,9 @@ Hermetic test env overrides (used by tests so they don't touch real state):
   are gitignored; the `*-sample.json` fixtures are the committed TDD ground truth.
 - **Tool-name matching uses a `__` boundary**, never loose `ends_with` (both
   `mcp::is_target` and `filter::matches_tool`) — so `metadata` does not match
-  `set_metadata`.
+  `set_metadata`. The write-side tools `send_code_connect_mappings` and
+  `add_code_connect_map` are deliberately absent from `TARGET_TOOLS` and are
+  never compressed by frtk.
 - Aggressive/ultra filters can **drop data** → keep `tee` recoverable; `serve` warns
   if level is aggressive+ and tee is off. Filters never apply at Standard, and
   project-local filters never apply unless the directory is `frtk trust`ed.

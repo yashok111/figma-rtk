@@ -49,6 +49,10 @@ pub struct Config {
     pub exclude_tools: Vec<String>,
     pub tee: TeeConfig,
     pub cache: CacheConfig,
+    /// MCP annotation pre-filter: drop content items whose `annotations.priority`
+    /// is below this floor (Aggressive+ only). Default 0.0 = no-op (nothing
+    /// dropped). Figma does not emit annotations yet, so this is future-ready.
+    pub min_priority: f64,
 }
 
 impl Config {
@@ -119,6 +123,24 @@ mod tests {
         assert_eq!(c.level, Level::Standard);
         assert_eq!(c.tee.mode, TeeMode::Never);
         assert!(c.exclude_tools.is_empty());
+        // R2-B: min_priority must default to 0.0 (annotation pre-filter no-op).
+        assert_eq!(c.min_priority, 0.0_f64);
+    }
+
+    #[test]
+    fn min_priority_parses_explicit_value() {
+        let toml = "min_priority = 0.5\n";
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!((c.min_priority - 0.5_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn min_priority_absent_yields_zero() {
+        // An old config file with no min_priority field must parse successfully
+        // and yield 0.0 (true no-op).
+        let toml = "level = \"aggressive\"\n";
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.min_priority, 0.0_f64);
     }
 
     #[test]

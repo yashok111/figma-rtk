@@ -9,3 +9,6 @@
 # Third-party skills installed by scripts/install-skills.sh into .agents/skills/
 # (vendored from upstream repos, re-creatable from the script — not committed).
 /.agents/skills/
+
+# Throwaway multi-agent Workflow orchestration scripts (session-local tooling).
+/.wf/

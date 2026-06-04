@@ -8,16 +8,30 @@
 #![allow(clippy::await_holding_lock)]
 
 use axum::body::Body;
-use axum::http::{header, Method, Request, StatusCode};
-use axum::routing::post;
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+use axum::routing::{delete, post};
 use axum::Router;
-use figma_rtk::{cache, proxy};
+use figma_rtk::{cache, proxy, stats::StatRec};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 /// Serializes tests that mutate the process-global FRTK_LEDGER env var.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Poll `check` every 5 ms until it returns true, or until 500 ms have elapsed.
+/// Used to handle the now-async (spawn_blocking) write side-effects: the proxy
+/// returns the response before the fs write completes, so assertions that read
+/// ledger/tee/capture files need to wait a short time for the write to land.
+async fn poll_until(check: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
 
 /// Minified form of the inner payload below (serde sorts object keys).
 const EXPECT_MIN: &str = r#"{"children":[{"id":1},{"id":2}],"frame":"Hero"}"#;
@@ -105,7 +119,14 @@ async fn pipeline_compresses_captures_and_meters() {
     assert_eq!(text, EXPECT_MIN, "inner text must be minified");
     assert!(text.len() < inner_pretty().len(), "must be smaller");
 
-    // capture wrote a fixture of the raw (pre-compression) body
+    // capture wrote a fixture of the raw (pre-compression) body — poll until
+    // the spawn_blocking write completes (proxy returns response before fs write).
+    poll_until(|| {
+        std::fs::read_dir(&capture)
+            .map(|d| d.filter_map(|e| e.ok()).count() >= 1)
+            .unwrap_or(false)
+    })
+    .await;
     let fixtures: Vec<_> = std::fs::read_dir(&capture)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -133,10 +154,37 @@ async fn pipeline_compresses_captures_and_meters() {
     );
 
     // --- ledger recorded both calls ---------------------------------------
+    // Poll until both ledger lines are flushed by the spawn_blocking tasks.
+    poll_until(|| {
+        std::fs::read_to_string(&ledger)
+            .map(|s| s.lines().count() >= 2)
+            .unwrap_or(false)
+    })
+    .await;
     let recorded = std::fs::read_to_string(&ledger).unwrap();
     let lines: Vec<&str> = recorded.lines().collect();
     assert_eq!(lines.len(), 2, "two compressed calls metered");
     assert!(recorded.contains("get_design_context"));
+
+    // Verify that proxy.rs actually stamps upstream_ms and level into each
+    // written StatRec — a regression removing the stamping loop would leave
+    // those fields at their zero/empty defaults. `level` is the reliable witness
+    // (always non-empty once stamped); upstream_ms is NOT asserted > 0 because a
+    // sub-millisecond in-process round-trip truncates to 0 via as_millis() and
+    // would flake.
+    let first_rec: StatRec = serde_json::from_str(lines[0])
+        .expect("first ledger line must deserialise as StatRec");
+    assert!(
+        !first_rec.level.is_empty(),
+        "level must be non-empty in the ledger record (stamping loop ran)"
+    );
+
+    let second_rec: StatRec = serde_json::from_str(lines[1])
+        .expect("second ledger line must deserialise as StatRec");
+    assert!(
+        !second_rec.level.is_empty(),
+        "level must be non-empty in the second ledger record (stamping loop ran)"
+    );
 
     std::env::remove_var("FRTK_LEDGER");
     let _ = std::fs::remove_dir_all(&base);
@@ -391,15 +439,15 @@ async fn lying_content_length_small_body_forwarded() {
 // ---------------------------------------------------------------------------
 
 /// A non-responding upstream (hangs forever on the TCP accept, never reads
-/// the request) must produce a 502 from the proxy instead of hanging forever.
-/// We simulate this by binding a listener but never calling accept() on it.
+/// the request) must produce a 504 Gateway Timeout from the proxy instead of
+/// hanging forever. We simulate this by binding a listener, accepting the
+/// TCP connection, but never writing anything back — reqwest's read timeout
+/// fires and the classified error is 504.
 #[tokio::test]
-async fn hung_upstream_returns_502() {
-    // Bind a port and immediately drop the listener — the TCP SYN will be
-    // refused (connection refused), which maps to a connect error, not a hang.
-    // To simulate a truly hung upstream we bind the listener and keep it alive
-    // (accepting the TCP connection) but never respond. We do this by spawning
-    // a task that accepts and then sleeps forever.
+async fn hung_upstream_returns_504() {
+    // Bind a port and keep the listener alive (accepting the TCP connection)
+    // but never respond. We do this by spawning a task that accepts and then
+    // sleeps forever.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -432,8 +480,46 @@ async fn hung_upstream_returns_502() {
     let resp = proxy::app(state).oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "hung upstream must yield 504 (timeout classified)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SEC-R1-3: Error classification — connect-refused → 502, timeout → 504
+// ---------------------------------------------------------------------------
+
+/// Connection-refused error (upstream not listening) must yield 502, not 500
+/// or a generic error. This tests the `is_connect()` branch of classify_error.
+#[tokio::test]
+async fn connect_refused_returns_502() {
+    // Bind a port, then immediately drop the listener so the port is closed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener); // port is now closed — any connection attempt is refused
+
+    let upstream = format!("http://{addr}");
+    let state = proxy::build_state_with_timeouts(
+        &upstream,
+        None,
+        figma_rtk::config::TeeMode::Never,
+        None,
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_millis(500),
+    )
+    .unwrap();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(rpc_request()))
+        .unwrap();
+    let resp = proxy::app(state).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
         StatusCode::BAD_GATEWAY,
-        "hung upstream must yield 502"
+        "connection-refused must yield 502"
     );
 }
 
@@ -760,6 +846,14 @@ async fn tee_writes_raw_body_to_dir() {
 
     let _ = post_through_proxy(state).await;
 
+    // Poll until the spawn_blocking tee write completes.
+    poll_until(|| {
+        std::fs::read_dir(&tee_dir)
+            .map(|d| d.filter_map(|e| e.ok()).count() >= 1)
+            .unwrap_or(false)
+    })
+    .await;
+
     // The tee dir must contain exactly one file named after the tool.
     let entries: Vec<_> = std::fs::read_dir(&tee_dir)
         .unwrap()
@@ -770,6 +864,66 @@ async fn tee_writes_raw_body_to_dir() {
     // The file must be byte-identical to the raw upstream body (pre-compression).
     let raw = std::fs::read_to_string(entries[0].path()).unwrap();
     assert_eq!(raw, rpc_response_envelope(), "tee file must be byte-identical to the raw upstream body");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// SAFETY: a batch carrying several target tools must tee the raw body under
+/// EACH tool's filename, not just the lexicographically smallest. Otherwise a
+/// lossy op (e.g. get_screenshot recompression) cannot recover its raw — it
+/// would be hidden under another tool's name. "get_metadata" sorts before
+/// "get_screenshot", so the old `min()` labelling wrote only get_metadata.raw.
+#[tokio::test]
+async fn tee_labels_raw_under_every_target_tool_in_a_batch() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-tee-batch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let tee_dir = base.join("tee");
+
+    // Batch response with both ids (content arbitrary; tee saves the whole body).
+    let batch_resp = serde_json::json!([
+        {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}},
+        {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"image","data":"AAAA","mediaType":"image/png"}]}}
+    ]).to_string();
+    let upstream = spawn_mock(batch_resp, "application/json").await;
+
+    let state = proxy::build_state_with(
+        &upstream,
+        None,
+        figma_rtk::config::TeeMode::Always,
+        Some(tee_dir.clone()),
+        figma_rtk::config::Level::Standard,
+        figma_rtk::filter::FilterSet::default(),
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+
+    // Batch request: id=1 get_metadata, id=2 get_screenshot (both TARGET_TOOLS).
+    let batch_req = serde_json::json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_metadata","arguments":{}}},
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_screenshot","arguments":{}}}
+    ]).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(batch_req))
+        .unwrap();
+    let _ = proxy::app(state).oneshot(req).await.unwrap();
+
+    // Poll until both spawn_blocking tee writes land.
+    poll_until(|| {
+        tee_dir.join("get_metadata.raw").exists() && tee_dir.join("get_screenshot.raw").exists()
+    })
+    .await;
+
+    assert!(tee_dir.join("get_metadata.raw").exists(), "get_metadata.raw must exist");
+    assert!(
+        tee_dir.join("get_screenshot.raw").exists(),
+        "get_screenshot.raw must exist — a batch must not hide one tool's raw under another's filename"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -865,6 +1019,14 @@ async fn batch_request_compresses_target_and_passes_nontarget() {
     );
 
     // Exactly 1 ledger line (only the target tool was compressed).
+    // Poll until the spawn_blocking ledger write completes.
+    let ledger_clone = ledger.clone();
+    poll_until(move || {
+        std::fs::read_to_string(&ledger_clone)
+            .map(|s| s.lines().count() >= 1)
+            .unwrap_or(false)
+    })
+    .await;
     let ledger_content = std::fs::read_to_string(&ledger).unwrap_or_default();
     let ledger_lines: Vec<&str> = ledger_content.lines().collect();
     assert_eq!(
@@ -882,14 +1044,14 @@ async fn batch_request_compresses_target_and_passes_nontarget() {
 }
 
 // ---------------------------------------------------------------------------
-// COV-8: Oversized REQUEST body returns 502
+// COV-8: Oversized REQUEST body returns 413
 // ---------------------------------------------------------------------------
 
-/// A POST whose body exceeds MAX_REQ_BODY (32 MiB) must produce 502 — this is
-/// the REQUEST-side cap, distinct from the RESPONSE-side cap tested in
-/// `oversized_response_body_returns_502`.
+/// A POST whose body exceeds MAX_REQ_BODY (32 MiB) must produce 413 Payload
+/// Too Large — this is the REQUEST-side cap, distinct from the RESPONSE-side
+/// cap tested in `oversized_response_body_returns_502`.
 #[tokio::test]
-async fn oversized_request_body_returns_502() {
+async fn oversized_request_body_returns_413() {
     // Any upstream will do — the proxy must reject the request before sending it.
     let upstream = spawn_mock("{}".to_string(), "application/json").await;
     let state = proxy::build_state(&upstream, None).unwrap();
@@ -907,8 +1069,8 @@ async fn oversized_request_body_returns_502() {
     let resp = proxy::app(state).oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_GATEWAY,
-        "oversized request body must yield 502"
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "oversized request body must yield 413, not 502"
     );
 }
 
@@ -954,4 +1116,146 @@ async fn already_compact_content_produces_no_ledger_entry() {
 
     std::env::remove_var("FRTK_LEDGER");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// R2-B: Streamable-HTTP session lifecycle — init → tools/call → DELETE
+// ---------------------------------------------------------------------------
+
+/// A mock upstream that:
+///   - Records inbound request headers for every method (POST and DELETE).
+///   - Responds to POST /mcp with a normal JSON-RPC result and sets
+///     `Mcp-Session-Id` on the response.
+///   - Responds to DELETE /mcp with 200 OK (session termination).
+///
+/// The captured headers are written into `captured_req_headers`; the test
+/// asserts that the `Mcp-Session-Id` the client sent was relayed.
+async fn spawn_session_mock(
+    captured_req_headers: Arc<Mutex<Vec<HeaderMap>>>,
+) -> String {
+    let captured_post = captured_req_headers.clone();
+    let captured_delete = captured_req_headers.clone();
+
+    let router = Router::new()
+        .route(
+            "/mcp",
+            post(move |req: axum::extract::Request| {
+                let cap = captured_post.clone();
+                async move {
+                    cap.lock().unwrap_or_else(|e| e.into_inner())
+                        .push(req.headers().clone());
+                    axum::response::Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("mcp-session-id", "sess-abc-123")
+                        .body(Body::from(rpc_response_envelope()))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/mcp",
+            delete(move |req: axum::extract::Request| {
+                let cap = captured_delete.clone();
+                async move {
+                    cap.lock().unwrap_or_else(|e| e.into_inner())
+                        .push(req.headers().clone());
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Streamable-HTTP session lifecycle: the proxy must relay `Mcp-Session-Id`
+/// transparently on both the request leg (client → upstream) and the response
+/// leg (upstream → client), and must forward DELETE /mcp to the upstream and
+/// relay its termination status.
+///
+/// This test documents already-correct behaviour (the header is in neither
+/// REQ_HOP_BY_HOP nor RESP_HOP_BY_HOP); it is a regression guard, not a fix.
+#[tokio::test]
+async fn session_lifecycle_relays_session_id_and_delete() {
+    let captured_req_headers: Arc<Mutex<Vec<HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_session_mock(captured_req_headers.clone()).await;
+    let state = proxy::build_state(&upstream, None).unwrap();
+    let app = proxy::app(state);
+
+    // (1) POST (tools/call) with Mcp-Session-Id on the request —————————————
+    //     The proxy must relay the header to the upstream AND relay it back
+    //     from the upstream's response to the client.
+    let post_req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-session-id", "sess-abc-123")
+        .body(Body::from(rpc_request()))
+        .unwrap();
+    let post_resp = app.clone().oneshot(post_req).await.unwrap();
+    assert_eq!(post_resp.status(), StatusCode::OK, "POST must succeed");
+
+    // Check that Mcp-Session-Id was relayed back on the response leg.
+    let resp_session_id = post_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        resp_session_id, "sess-abc-123",
+        "Mcp-Session-Id from upstream response must be relayed to the client"
+    );
+
+    // Check that Mcp-Session-Id was relayed on the request leg (to the upstream).
+    {
+        let hdrs = captured_req_headers.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !hdrs.is_empty(),
+            "mock must have captured the POST request headers"
+        );
+        let relayed = hdrs[0]
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            relayed, "sess-abc-123",
+            "Mcp-Session-Id must be relayed from the client to the upstream on the request leg"
+        );
+    }
+
+    // (2) DELETE /mcp — session teardown ————————————————————————————————————
+    //     The proxy must forward the DELETE to the upstream and relay the 200.
+    let delete_req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/mcp")
+        .header("mcp-session-id", "sess-abc-123")
+        .body(Body::empty())
+        .unwrap();
+    let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
+    assert_eq!(
+        delete_resp.status(),
+        StatusCode::OK,
+        "DELETE /mcp must be forwarded and the upstream's 200 relayed"
+    );
+
+    // Check that the DELETE also relayed Mcp-Session-Id to the upstream.
+    {
+        let hdrs = captured_req_headers.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(hdrs.len(), 2, "both POST and DELETE must have been captured");
+        let delete_session = hdrs[1]
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            delete_session, "sess-abc-123",
+            "Mcp-Session-Id must be relayed to the upstream on the DELETE request leg"
+        );
+    }
 }
