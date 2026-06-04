@@ -2,7 +2,6 @@
 //! responses by id, and rewrite the responses of the heavy read tools.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
 
@@ -11,6 +10,7 @@ use crate::compress;
 use crate::config::Level;
 use crate::filter::FilterSet;
 use crate::stats::StatRec;
+use crate::tokens;
 
 /// Tools whose responses are worth compressing. Matched against the wire tool
 /// name (Figma's own names, e.g. "get_design_context").
@@ -20,14 +20,25 @@ pub const TARGET_TOOLS: &[&str] = &[
     // Flat design-token map (token -> value); losslessly minified + delta-cached
     // (tokens rarely change, so re-reads of the same node collapse to a sentinel).
     "get_variable_defs",
-    // node -> { codeConnectSrc, codeConnectName } map. Added blind (capture needs
-    // a Figma Developer/Enterprise seat); the generic JSON compression path applies.
+    // node -> { codeConnectSrc, codeConnectName, … } map — exact shape unverified
+    // (no captured fixture; Enterprise seat required). Added blind; the generic
+    // JSON compression path applies.
     "get_code_connect_map",
     // The general-purpose write/inspect tool: it JSON-serializes its return value,
     // and read-only discovery calls (findAll / children dumps) return large node
     // trees. Minified losslessly + delta-cached; write returns (small id lists)
     // compress harmlessly.
     "use_figma",
+    // Screenshot tool: by default the response is a TEXT block holding a
+    // short-lived URL (+ a curl note); an inline image content block appears only
+    // when enableBase64Response=true. Text is minified; image blocks (when
+    // present) pass through byte-for-byte but their payload size is metered for
+    // volume tracking (image_bytes in Savings).
+    "get_screenshot",
+    // Context-for-code-connect and suggestions: JSON payloads with component
+    // metadata; losslessly minified via the standard text pass.
+    "get_context_for_code_connect",
+    "get_code_connect_suggestions",
 ];
 
 fn is_target(name: &str) -> bool {
@@ -56,9 +67,11 @@ pub struct Target {
 }
 
 fn cache_key(tool: &str, args: &Value) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(args).unwrap_or_default().hash(&mut h);
-    format!("{tool}|{:x}", h.finish())
+    // FNV-1a over the serialized args — deterministic across processes so that
+    // primed entries loaded from disk can match live observe calls after restart.
+    let serialized = serde_json::to_string(args).unwrap_or_default();
+    let h = crate::cache::fnv1a(serialized.as_bytes());
+    format!("{tool}|{h:016x}")
 }
 
 /// Scan a JSON-RPC request body (single message or batch array) and return a
@@ -109,15 +122,11 @@ pub fn transform_value(
     match v {
         Value::Array(a) => {
             for m in a.iter_mut() {
-                if let Some(r) = transform_msg(m, ids, level, filters, cache) {
-                    recs.push(r);
-                }
+                recs.extend(transform_msg(m, ids, level, filters, cache));
             }
         }
         other => {
-            if let Some(r) = transform_msg(other, ids, level, filters, cache) {
-                recs.push(r);
-            }
+            recs.extend(transform_msg(other, ids, level, filters, cache));
         }
     }
     recs
@@ -129,35 +138,104 @@ fn transform_msg(
     level: Level,
     filters: &FilterSet,
     cache: Option<&DeltaCache>,
-) -> Option<StatRec> {
-    let id = msg.get("id")?;
-    let target = ids.get(&id_to_string(id))?.clone();
-    let result = msg.get_mut("result")?;
+) -> Vec<StatRec> {
+    let Some(id) = msg.get("id") else {
+        return vec![];
+    };
+    let Some(target) = ids.get(&id_to_string(id)).cloned() else {
+        return vec![];
+    };
+    let Some(result) = msg.get_mut("result") else {
+        return vec![];
+    };
     // Original upstream content size, before compression — used for the delta
     // sentinel's "bytes elided" figure and its savings record.
     let orig_before = cache::content_text_len(result);
+    // Capture the before-text (concatenated) for content-aware token estimation.
+    // content_text() is a non-breaking sibling of content_text_len — it re-uses
+    // the same traversal logic without modifying any existing callers.
+    let before_text = cache::content_text(result);
+    let tok_before = tokens::est_str(&before_text);
+
     let sv = compress::compress_result_with(result, &target.tool, level, filters);
+
     // Delta cache: collapse a byte-identical re-read to a sentinel.
     if let Some(cache) = cache {
         if let Some(after) = cache::apply_delta(cache, &target.key, &target.tool, result, orig_before)
         {
-            return Some(StatRec {
+            // After delta-collapse: content is now the sentinel string.
+            let after_text = cache::content_text(result);
+            let tok_after = tokens::est_str(&after_text);
+            return vec![StatRec {
                 tool: target.tool,
                 before: orig_before,
                 after,
                 ts: 0,
-            });
+                tok_before: Some(tok_before),
+                tok_after: Some(tok_after),
+                // upstream_ms and level are stamped by proxy.rs after the
+                // upstream call returns; leave them at their defaults here.
+                upstream_ms: 0,
+                level: String::new(),
+            }];
         }
     }
     if sv.mutated || sv.any() {
-        Some(StatRec {
-            tool: target.tool,
+        // After compression: capture the post-compress text for token estimation.
+        let after_text = cache::content_text(result);
+        let tok_after = tokens::est_str(&after_text);
+        let mut recs = vec![StatRec {
+            tool: target.tool.clone(),
             before: sv.before,
             after: sv.after,
             ts: 0,
-        })
+            tok_before: Some(tok_before),
+            tok_after: Some(tok_after),
+            // upstream_ms and level are stamped by proxy.rs after the
+            // upstream call returns; leave them at their defaults here.
+            upstream_ms: 0,
+            level: String::new(),
+        }];
+        // Mixed text+image: also emit a volume record for the image bytes so the
+        // ledger captures the full response size. The image record has
+        // before==after==image_bytes and tok_before==tok_after==Some(0) so that:
+        //   (a) it never inflates the "tokens saved" figure (vision tokens are
+        //       priced on pixels, not byte/4), and
+        //   (b) print_gain can detect it as a volume record and print the note.
+        if sv.image_bytes > 0 {
+            recs.push(StatRec {
+                tool: target.tool,
+                before: sv.image_bytes,
+                after: sv.image_bytes,
+                ts: 0,
+                tok_before: Some(0),
+                tok_after: Some(0),
+                upstream_ms: 0,
+                level: String::new(),
+            });
+        }
+        recs
+    } else if sv.image_bytes > 0 {
+        // Image-only (or image + already-compact text): no text savings, but
+        // we still emit a StatRec so the ledger tracks screenshot volume.
+        // before==after==image_bytes so the record shows 0 bytes saved.
+        // Token fields are set EQUAL (both 0) so that
+        //   tok_before.saturating_sub(tok_after) == 0
+        // and print_gain never shows a bogus per-tool token figure derived
+        // from dividing raw base64 bytes by 4 (vision tokens are priced on
+        // pixels, not text-token equivalents).
+        vec![StatRec {
+            tool: target.tool,
+            before: sv.image_bytes,
+            after: sv.image_bytes,
+            ts: 0,
+            tok_before: Some(0),
+            tok_after: Some(0),
+            upstream_ms: 0,
+            level: String::new(),
+        }]
     } else {
-        None
+        vec![]
     }
 }
 
@@ -465,6 +543,97 @@ mod tests {
         assert!(out.contains(r#"{\"a\":1,\"b\":2}"#), "content minified (escaped in wire)");
     }
 
+    // ----- R0-3: new TARGET_TOOLS and image-block metering -----
+
+    #[test]
+    fn get_screenshot_is_a_target_and_produces_stat_rec() {
+        // get_screenshot must be in TARGET_TOOLS (matched via __ boundary) and
+        // produce a StatRec when the response contains an image block.
+        let req = br#"{"id":10,"method":"tools/call","params":{"name":"get_screenshot","arguments":{}}}"#;
+        assert_eq!(
+            extract_targets(req).get("10").map(|t| t.tool.as_str()),
+            Some("get_screenshot"),
+            "get_screenshot must be extracted as a target"
+        );
+
+        // Also verify namespaced wire name matches.
+        let req2 = br#"{"id":11,"method":"tools/call","params":{"name":"mcp__plugin_figma_figma__get_screenshot","arguments":{}}}"#;
+        assert_eq!(
+            extract_targets(req2).get("11").map(|t| t.tool.as_str()),
+            Some("mcp__plugin_figma_figma__get_screenshot"),
+            "namespaced get_screenshot must be a target"
+        );
+
+        // An image-only response: StatRec emitted, before==after==image_bytes, saved==0.
+        let mut ids = HashMap::new();
+        ids.insert("10".to_string(), target("get_screenshot"));
+        let img_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "id": 10,
+                "result": {
+                    "content": [{"type": "image", "data": img_data, "mediaType": "image/png"}]
+                }
+            })).unwrap()
+        );
+        let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
+        assert_eq!(recs.len(), 1, "StatRec must be emitted for image block");
+        let rec = &recs[0];
+        let img_bytes = img_data.len();
+        assert_eq!(rec.before, img_bytes, "before == image_bytes");
+        assert_eq!(rec.after, img_bytes, "after == image_bytes (no savings)");
+        // Token fields must be explicitly equal so no fake savings are shown.
+        assert_eq!(rec.tok_before, rec.tok_after, "tok_before == tok_after for image records");
+    }
+
+    #[test]
+    fn get_context_for_code_connect_is_a_target() {
+        let req = br#"{"id":20,"method":"tools/call","params":{"name":"get_context_for_code_connect","arguments":{}}}"#;
+        assert_eq!(
+            extract_targets(req).get("20").map(|t| t.tool.as_str()),
+            Some("get_context_for_code_connect"),
+            "get_context_for_code_connect must be a target"
+        );
+    }
+
+    #[test]
+    fn get_code_connect_suggestions_is_a_target() {
+        let req = br#"{"id":21,"method":"tools/call","params":{"name":"get_code_connect_suggestions","arguments":{}}}"#;
+        assert_eq!(
+            extract_targets(req).get("21").map(|t| t.tool.as_str()),
+            Some("get_code_connect_suggestions"),
+            "get_code_connect_suggestions must be a target"
+        );
+    }
+
+    #[test]
+    fn image_block_stat_rec_has_zero_token_savings() {
+        // An image block StatRec must show zero tokens saved (tok_before == tok_after)
+        // so that print_gain does not print a bogus per-tool token figure.
+        let mut ids = HashMap::new();
+        ids.insert("30".to_string(), target("get_screenshot"));
+        let img_data = "abc123base64data";
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "id": 30,
+                "result": {
+                    "content": [{"type": "image", "data": img_data}]
+                }
+            })).unwrap()
+        );
+        let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
+        assert_eq!(recs.len(), 1, "StatRec emitted");
+        let rec = &recs[0];
+        // tok_before and tok_after must be equal (both 0 or both the same non-zero value)
+        // so that tok_before.saturating_sub(tok_after) == 0.
+        let tb = rec.tok_before.unwrap_or(0);
+        let ta = rec.tok_after.unwrap_or(0);
+        assert_eq!(tb, ta, "no token savings for image-volume records");
+        assert_eq!(tb.saturating_sub(ta), 0, "token saved must be 0");
+    }
+
     #[test]
     fn sse_structural_mutation_drop_meta_image_block() {
         // SSE path: apply_structural drops _meta + non-text (image) blocks are
@@ -493,8 +662,36 @@ mod tests {
         let (out, recs) = transform_sse(&body, &ids, Level::Aggressive, &fs, None);
         // _meta must have been dropped from the forwarded bytes.
         assert!(!out.contains("mcpRequestId"), "_meta dropped by structural filter");
-        // A StatRec must be emitted (mutation flag gates it, not savings bytes).
-        assert_eq!(recs.len(), 1, "StatRec emitted for structural mutation with image-only content");
+        // Deterministically 2 records here: one for the structural mutation (the
+        // mutated flag), one for the image url volume (url has length > 0).
+        assert_eq!(
+            recs.len(),
+            2,
+            "structural-mutation record + image-volume record both emitted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R2-A: cache_key stability (cross-process determinism via FNV-1a)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_key_is_deterministic_across_calls() {
+        let args = serde_json::json!({"nodeId": "1:23", "depth": 2});
+        let k1 = cache_key("get_metadata", &args);
+        let k2 = cache_key("get_metadata", &args);
+        assert_eq!(k1, k2, "cache_key must be byte-stable across calls (FNV-1a)");
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_tool_or_args() {
+        let args = serde_json::json!({"nodeId": "1:23"});
+        let k1 = cache_key("get_metadata", &args);
+        let k2 = cache_key("get_design_context", &args);
+        assert_ne!(k1, k2, "different tool -> different key");
+        let args2 = serde_json::json!({"nodeId": "9:99"});
+        let k3 = cache_key("get_metadata", &args2);
+        assert_ne!(k1, k3, "different args -> different key");
     }
 
     // ----- CORR-3: Savings::any() tightened; no spurious StatRec -----
@@ -525,5 +722,62 @@ mod tests {
         );
         let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
         assert!(recs.is_empty(), "no StatRec for already-compact content (got {:?})", recs);
+    }
+
+    // ----- R0-3 blocker fix: mixed text+image responses must record image volume -----
+
+    #[test]
+    fn mixed_text_and_image_image_bytes_reach_ledger() {
+        // BLOCKER fix: when a response contains BOTH a compressible text block AND
+        // an image block, the image volume must appear in the emitted StatRec.
+        // Previously, sv.image_bytes was silently discarded when sv.mutated||sv.any()
+        // was true — the else-if branch was never reached.
+        let mut ids = HashMap::new();
+        ids.insert("40".to_string(), target("get_screenshot"));
+        let img_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        // Include a pretty-printed JSON text block (compressible — will shrink) AND
+        // an image block. This exercises the `sv.mutated || sv.any()` branch while
+        // also having sv.image_bytes > 0.
+        let pretty_text = "{\n  \"caption\": \"screenshot\"\n}";
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "id": 40,
+                "result": {
+                    "content": [
+                        {"type": "text", "text": pretty_text},
+                        {"type": "image", "data": img_data, "mediaType": "image/png"}
+                    ]
+                }
+            }))
+            .unwrap()
+        );
+        let (_out, recs) =
+            transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
+        // Two StatRecs: one for text savings, one for the image volume.
+        assert_eq!(recs.len(), 2, "separate StatRecs for text savings and image volume");
+
+        // Find the image-volume record: tok_before == Some(0) && tok_after == Some(0)
+        // and before == after (by the image-volume invariant).
+        let img_rec = recs
+            .iter()
+            .find(|r| r.tok_before == Some(0) && r.tok_after == Some(0) && r.before == r.after)
+            .expect("image-volume StatRec must be emitted");
+        let img_len = img_data.len();
+        assert_eq!(
+            img_rec.before, img_len,
+            "image-volume StatRec.before must equal image_bytes ({})",
+            img_len
+        );
+
+        // The text record: tok_before != tok_after (text was actually compressed).
+        let text_rec = recs
+            .iter()
+            .find(|r| !(r.tok_before == Some(0) && r.tok_after == Some(0) && r.before == r.after))
+            .expect("text-savings StatRec must also be emitted");
+        assert!(
+            text_rec.before > 0,
+            "text StatRec.before must be > 0 (text was present)"
+        );
     }
 }

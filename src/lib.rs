@@ -13,6 +13,7 @@ pub mod init;
 pub mod mcp;
 pub mod proxy;
 pub mod stats;
+pub mod status;
 pub mod tee;
 pub mod tokens;
 pub mod trust;

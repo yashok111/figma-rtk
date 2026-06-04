@@ -10,10 +10,12 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 use axum::body::Bytes;
+use futures::StreamExt;
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::cache::DeltaCache;
 use crate::config::{Level, TeeMode};
@@ -57,6 +59,10 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Default total (read) timeout for the upstream reqwest client.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Idle window for the GET /mcp SSE stream: if no chunk arrives within this
+/// duration, the stream is terminated rather than hanging forever.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -206,7 +212,22 @@ pub async fn serve(
     }
     let filters = load_filters();
     let filter_count = filters.len();
-    let delta_cache = cfg.cache.delta.then(|| Arc::new(DeltaCache::new(256)));
+
+    // Construct the delta cache (when enabled) and prime it from disk so that
+    // byte-identical re-reads can collapse to a sentinel even on the first call
+    // after a restart. The cache Arc is cloned into the shutdown future so we
+    // can flush it on graceful shutdown.
+    let delta_cache: Option<Arc<DeltaCache>> = if cfg.cache.delta {
+        let cache = Arc::new(DeltaCache::new(256));
+        if let Some(path) = delta_cache_path() {
+            cache.prime_from(&path);
+            tracing::debug!("delta-cache primed from {}", path.display());
+        }
+        Some(cache)
+    } else {
+        None
+    };
+
     let state = build_state_with(
         upstream,
         capture_dir,
@@ -214,7 +235,7 @@ pub async fn serve(
         tee_dir,
         level,
         filters,
-        delta_cache,
+        delta_cache.clone(),
         cfg.exclude_tools.clone(),
     )?;
     let app = app(state);
@@ -228,14 +249,22 @@ pub async fn serve(
     tracing::info!("frtk listening on http://{addr}  ->  {upstream}");
     tracing::info!("run `frtk gain` to see token savings");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(delta_cache))
         .await?;
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(delta_cache: Option<Arc<DeltaCache>>) {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
+    // Flush the delta cache to disk (best-effort — never panic or crash the
+    // process on failure; a missing flush just means a cold start next time).
+    if let Some(cache) = delta_cache {
+        if let Some(path) = delta_cache_path() {
+            cache.flush_to(&path);
+            tracing::debug!("delta-cache flushed to {}", path.display());
+        }
+    }
 }
 
 async fn handle(State(st): State<AppState>, req: Request) -> Response {
@@ -253,8 +282,9 @@ async fn handle(State(st): State<AppState>, req: Request) -> Response {
         }
         Err(e) => {
             // Never log headers or bodies — they carry the Bearer token.
-            tracing::warn!("proxy error: {e}");
-            error_response(StatusCode::BAD_GATEWAY, &format!("frtk upstream error: {e}"))
+            let (status, kind) = classify_error(&e);
+            tracing::warn!("proxy error [{kind}]: {e}");
+            error_response(status, &format!("frtk upstream error [{kind}]: {e}"))
         }
     }
 }
@@ -271,7 +301,29 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
         .to_string();
     let url = format!("{}{}", st.upstream, pq);
 
-    let body_bytes = axum::body::to_bytes(body, MAX_REQ_BODY).await?;
+    // SEC-R1-3: handle the over-cap case locally so we can return 413 instead of
+    // propagating `?` up to the generic 502 branch.  Only `LengthLimitError`
+    // produces a 413; any other body error (client disconnect, HTTP framing)
+    // falls through to the generic classify_error → 502 path via `?`.
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQ_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            // axum_core::Error wraps the real cause as its std::error::Error
+            // source.  Check whether that source is a LengthLimitError before
+            // returning 413 — any other inner error should propagate as 502.
+            use std::error::Error as StdError;
+            let is_limit = StdError::source(&e)
+                .map(|src| src.is::<http_body_util::LengthLimitError>())
+                .unwrap_or(false);
+            if is_limit {
+                return Ok(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "frtk: request body exceeds the 32 MiB cap",
+                ));
+            }
+            return Err(anyhow::anyhow!(e));
+        }
+    };
 
     // Learn which JSON-RPC ids correspond to heavy read tools so we know which
     // responses to compress. Only POSTs carry tools/call requests.
@@ -294,6 +346,10 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     }
 
     let req_headers = filter_req_headers(&parts.headers);
+    // t0: start timing immediately before the upstream send.  upstream_ms
+    // covers the full upstream time: request send, response headers, and
+    // complete response body transfer — not only the header round-trip.
+    let t0 = std::time::Instant::now();
     let upstream_resp = st
         .client
         .request(method.clone(), &url)
@@ -327,11 +383,14 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     }
 
     // GET /mcp is the long-lived server->client SSE notification channel.
-    // It carries no tool results, so stream it straight through untouched.
+    // It carries no tool results, so stream it straight through untouched —
+    // but guarded by a per-chunk idle timeout so a stalled upstream doesn't
+    // hang the connection forever.
     if method == Method::GET {
         let builder = apply_resp_headers(Response::builder().status(status), &resp_headers);
+        let guarded = sse_idle_guarded(upstream_resp.bytes_stream(), SSE_IDLE_TIMEOUT);
         return Ok(builder
-            .body(Body::from_stream(upstream_resp.bytes_stream()))
+            .body(Body::from_stream(guarded))
             .unwrap());
     }
 
@@ -341,38 +400,81 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     // SEC-1: accumulate with cap; Content-Length is advisory and can lie.
     let bytes = collect_capped(upstream_resp, MAX_RESP_BODY).await?;
 
-    // capture/tee write the WHOLE response body labelled by one tool. For a
-    // batch with several target tools that's best-effort; pick deterministically
-    // (smallest name) rather than relying on HashMap order. The raw body is
-    // never split per-tool in v1.
-    let label_tool = target_ids.values().map(|t| &t.tool).min();
+    // capture/tee write the WHOLE response body, saved under EACH distinct target
+    // tool name. A batch must NOT hide one tool's raw under another tool's file —
+    // recovery (and any lossy op like get_screenshot recompression) looks the raw
+    // up BY TOOL NAME, so every target in the batch gets its own labelled copy.
+    // (The common single-target response writes exactly one file, as before.)
+    let mut label_tools: Vec<String> = target_ids.values().map(|t| t.tool.clone()).collect();
+    label_tools.sort();
+    label_tools.dedup();
+    // Representative name for the one-line happy-path log (smallest, deterministic).
+    let log_tool = label_tools.first().cloned();
 
     // Optional fixture capture: dump the raw target response body (no headers,
     // no token) so phase-2 compression can be developed against real payloads.
-    if let (Some(dir), Some(tool)) = (&st.capture_dir, label_tool) {
-        match crate::capture::save_next(dir, tool, &bytes) {
-            Ok(path) => tracing::info!("captured {tool} fixture -> {}", path.display()),
-            Err(e) => tracing::warn!("capture failed: {e}"),
+    // spawn_blocking so the std::fs write does not block the async response path.
+    if let Some(dir) = &st.capture_dir {
+        if !label_tools.is_empty() {
+            let dir = dir.clone();
+            let tools = label_tools.clone();
+            let bytes_cap = bytes.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                for tool in &tools {
+                    match crate::capture::save_next(&dir, tool, &bytes_cap) {
+                        Ok(path) => tracing::info!("captured {tool} fixture -> {}", path.display()),
+                        Err(e) => tracing::warn!("capture failed: {e}"),
+                    }
+                }
+            }));
         }
     }
 
     // Raw-payload recovery (tee): keep the last uncompressed body per tool so
     // aggressive compression remains recoverable.
-    if let (Some(dir), Some(tool)) = (&st.tee_dir, label_tool) {
-        crate::tee::maybe_save(st.tee_mode, dir, tool, &bytes);
+    // spawn_blocking so the std::fs write does not block the async response path.
+    if let Some(dir) = &st.tee_dir {
+        if !label_tools.is_empty() {
+            let dir = dir.clone();
+            let tools = label_tools.clone();
+            let mode = st.tee_mode;
+            let bytes_tee = bytes.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                for tool in &tools {
+                    crate::tee::maybe_save(mode, &dir, tool, &bytes_tee);
+                }
+            }));
+        }
     }
 
     if !target_ids.is_empty() {
         if ctype.contains("text/event-stream") {
             if let Ok(text) = std::str::from_utf8(&bytes) {
-                let (new_text, recs) = crate::mcp::transform_sse(
+                let (new_text, mut recs) = crate::mcp::transform_sse(
                     text,
                     &target_ids,
                     st.level,
                     &st.filters,
                     st.delta_cache.as_deref(),
                 );
-                crate::stats::record_all(recs);
+                let upstream_ms = t0.elapsed().as_millis() as u64;
+                let level_str = format!("{:?}", st.level);
+                for r in &mut recs {
+                    r.upstream_ms = upstream_ms;
+                    r.level = level_str.clone();
+                }
+                if !recs.is_empty() {
+                    tracing::info!(
+                        tool = ?log_tool,
+                        %path,
+                        status = status.as_u16(),
+                        upstream_ms,
+                        "proxied"
+                    );
+                    // spawn_blocking so the ledger write does not block the response
+                    // path; guarded so an empty batch never schedules a no-op task.
+                    drop(tokio::task::spawn_blocking(move || crate::stats::record_all(recs)));
+                }
                 return Ok(buffered(status, &resp_headers, new_text.into_bytes()));
             }
         } else if ctype.contains("application/json") {
@@ -380,7 +482,7 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
                 // Invariant: transform_value emits a StatRec whenever it mutates a
                 // result, so empty `recs` ⇒ `v` is unchanged ⇒ forwarding the
                 // original bytes is correct.
-                let recs = crate::mcp::transform_value(
+                let mut recs = crate::mcp::transform_value(
                     &mut v,
                     &target_ids,
                     st.level,
@@ -388,7 +490,21 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
                     st.delta_cache.as_deref(),
                 );
                 if !recs.is_empty() {
-                    crate::stats::record_all(recs);
+                    let upstream_ms = t0.elapsed().as_millis() as u64;
+                    let level_str = format!("{:?}", st.level);
+                    for r in &mut recs {
+                        r.upstream_ms = upstream_ms;
+                        r.level = level_str.clone();
+                    }
+                    tracing::info!(
+                        tool = ?log_tool,
+                        %path,
+                        status = status.as_u16(),
+                        upstream_ms,
+                        "proxied"
+                    );
+                    // spawn_blocking so the ledger write does not block the response path.
+                    drop(tokio::task::spawn_blocking(move || crate::stats::record_all(recs)));
                     let out = serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec());
                     return Ok(buffered(status, &resp_headers, out));
                 }
@@ -490,11 +606,73 @@ fn load_filters() -> FilterSet {
     set
 }
 
+/// Classify an upstream (or proxy-internal) error into an HTTP status code and
+/// a short kind string for log messages. Never reads headers, bodies, or the
+/// Bearer token.
+///
+/// * Timeout errors          → 504 Gateway Timeout
+/// * Connection errors       → 502 Bad Gateway (with "connect" reason)
+/// * Request body too large  → handled in proxy_once before this is called;
+///   the kind "body" is reserved for future use
+/// * Everything else         → 502 Bad Gateway
+pub(crate) fn classify_error(e: &anyhow::Error) -> (StatusCode, &'static str) {
+    // Downcast to reqwest::Error to check the specific failure kind.
+    if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+        if re.is_timeout() {
+            return (StatusCode::GATEWAY_TIMEOUT, "timeout");
+        }
+        if re.is_connect() {
+            return (StatusCode::BAD_GATEWAY, "connect");
+        }
+    }
+    (StatusCode::BAD_GATEWAY, "upstream")
+}
+
+/// Wrap a `reqwest` bytes stream with a per-chunk idle timeout.
+///
+/// If no chunk arrives within `idle` duration, the stream ends cleanly — the
+/// caller sees end-of-stream, which `Body::from_stream` treats as the final
+/// byte. No panic is possible; the timeout simply closes the stream.
+fn sse_idle_guarded(
+    stream: impl futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    idle: Duration,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    // Box::pin gives us an Unpin handle we can hold as unfold state.
+    let pinned: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+        Box::pin(stream);
+    futures::stream::unfold(Some(pinned), move |state| async move {
+        let mut inner = state?; // None → already terminated; yield None.
+        match timeout(idle, inner.next()).await {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(inner))),
+            Ok(Some(Err(e))) => Some((Err(std::io::Error::other(e)), None)),
+            Ok(None) => None, // upstream closed cleanly
+            Err(_elapsed) => {
+                tracing::debug!("SSE idle timeout; closing stream");
+                None // end without an error frame
+            }
+        }
+    })
+}
+
 fn default_tee_dir() -> Option<PathBuf> {
     Some(
         dirs::data_dir()?
             .join("figma-rtk")
             .join("tee"),
+    )
+}
+
+/// Resolve the delta-cache persistence file path.
+/// Override with `FRTK_DELTA_CACHE`; default is
+/// `$XDG_DATA_HOME/figma-rtk/delta-cache.jsonl`.
+pub fn delta_cache_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("FRTK_DELTA_CACHE") {
+        return Some(PathBuf::from(p));
+    }
+    Some(
+        dirs::data_dir()?
+            .join("figma-rtk")
+            .join("delta-cache.jsonl"),
     )
 }
 
@@ -722,5 +900,59 @@ mod tests {
         assert!(!is_safe_host("bad\r\nhost"));
         assert!(!is_safe_host("ho st"));
         assert!(!is_safe_host(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-R1-3: error classification
+    // -----------------------------------------------------------------------
+
+    /// A non-reqwest error (e.g. a plain anyhow string error) must fall through
+    /// to the default 502 / "upstream" classification.
+    #[test]
+    fn classify_error_fallback_is_502_upstream() {
+        let e = anyhow::anyhow!("some generic error");
+        let (status, kind) = classify_error(&e);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(kind, "upstream");
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-R1-3: SSE idle guard unit test
+    // -----------------------------------------------------------------------
+
+    /// `sse_idle_guarded` with a very short idle window must terminate the
+    /// stream when no chunk arrives within the window, returning no items
+    /// beyond those already yielded.
+    #[tokio::test]
+    async fn sse_idle_guard_terminates_on_idle() {
+        use futures::StreamExt;
+        use std::time::Duration;
+
+        // A stream that yields one chunk immediately, then hangs forever.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, reqwest::Error>>();
+        tx.send(Ok(Bytes::from_static(b"hello"))).unwrap();
+        // Do NOT send a second chunk — the stream should idle-timeout.
+
+        let base_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        // Very short idle timeout for the test.
+        let idle = Duration::from_millis(50);
+        let mut guarded = Box::pin(sse_idle_guarded(base_stream, idle));
+
+        // First chunk arrives immediately.
+        let first = guarded.next().await;
+        assert!(
+            matches!(first, Some(Ok(ref b)) if b.as_ref() == b"hello"),
+            "first chunk must be forwarded: {first:?}"
+        );
+
+        // Second poll should time out and end the stream cleanly.
+        let second = guarded.next().await;
+        assert!(
+            second.is_none(),
+            "stream must end after idle timeout, not hang; got: {second:?}"
+        );
     }
 }

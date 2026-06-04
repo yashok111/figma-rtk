@@ -36,7 +36,9 @@ cargo build --release
 ```
 
 `frtk init` edits the figma plugin's `.mcp.json` `url` to `http://127.0.0.1:7337/mcp`
-(backing the original up to `.frtk-backup`); restart Claude Code afterwards.
+(backing the original up to `.frtk-backup`); then in Claude Code go to
+`/mcp` → `plugin:figma:figma` → **Reconnect** (a plain Claude Code restart may not
+clear the cached OAuth discovery).
 `frtk config` prints the equivalent snippet if you'd rather wire it by hand.
 
 ### Config (optional)
@@ -105,10 +107,10 @@ frtk compress --tool get_design_context --level aggressive < fixtures/get_design
 
 ## Not in v1 (later phases)
 
-Delta cache on re-reads, `frtk discover` (scan CC transcripts for un-proxied
-figma calls), FigmaKit write preamble, `assertNode` verification,
-`figma.manifest.json`. The proxy + config + tee + capture + filter engine built
-here are the foundation those build on.
+Delta cache on re-reads, `frtk discover` (analyse the savings ledger frtk
+already writes to surface un-proxied or high-cost Figma calls), FigmaKit write
+preamble, `assertNode` verification, `figma.manifest.json`. The proxy + config +
+tee + capture + filter engine built here are the foundation those build on.
 
 ## Layout
 

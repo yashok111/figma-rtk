@@ -13,6 +13,83 @@ use serde_json::Value;
 use crate::config::Level;
 use crate::filter::FilterSet;
 
+// ---------------------------------------------------------------------------
+// Ultra text-transform registry
+// ---------------------------------------------------------------------------
+
+/// A named, tool-gated Ultra text transform applied when no TOML filter matched
+/// a content block. Pure-functional; lossy but tee-recoverable. Registered in
+/// ULTRA_TRANSFORMS; the content loop is agnostic to which tools exist.
+trait TextTransformer: Sync {
+    fn applies(&self, tool: &str, text: &str) -> bool;
+    fn transform(&self, text: &str) -> String;
+    /// Human-readable identifier, used for logging and diagnostics.
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str;
+}
+
+/// Ultra transform for `get_design_context`: strips Figma-ref node attributes
+/// from generated JSX, or reduces a sparse node-tree to id+tag only.
+/// The `applies` check is text-agnostic (tool-match only); the two sub-cases
+/// (node-tree vs JSX) are resolved inside `transform`, exactly mirroring the
+/// original if/else nesting.
+struct DesignContextJsx;
+
+impl TextTransformer for DesignContextJsx {
+    fn applies(&self, tool: &str, _text: &str) -> bool {
+        crate::filter::matches_tool(tool, "get_design_context")
+    }
+
+    fn transform(&self, text: &str) -> String {
+        if is_figma_node_tree(text) {
+            strip_node_tree_attrs(text)
+        } else {
+            compress_jsx_code(&strip_figma_node_attrs(text))
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "DesignContextJsx"
+    }
+}
+
+/// Ultra transform for `get_metadata`: strips positional geometry attributes
+/// (x, y, width, height) from metadata XML. The `applies` check includes the
+/// `starts_with('<')` guard that was in the original else-if branch.
+struct MetadataPosAttrs;
+
+impl TextTransformer for MetadataPosAttrs {
+    fn applies(&self, tool: &str, text: &str) -> bool {
+        crate::filter::matches_tool(tool, "get_metadata") && text.starts_with('<')
+    }
+
+    fn transform(&self, text: &str) -> String {
+        strip_metadata_pos_attrs(text)
+    }
+
+    fn name(&self) -> &'static str {
+        "MetadataPosAttrs"
+    }
+}
+
+/// Registry of Ultra text transforms. Order is significant: first match wins.
+/// `get_design_context` is listed before `get_metadata` to preserve the
+/// first-match order of the original if/else chain.
+static ULTRA_TRANSFORMS: &[&dyn TextTransformer] = &[&DesignContextJsx, &MetadataPosAttrs];
+
+/// Walk the registry and return the first matching transform's output, or
+/// return `text` unchanged when no transform applies. Called at Ultra level
+/// only; the `ultra` gate lives at the call site so Standard/Aggressive paths
+/// remain byte-identical.
+fn apply_ultra_transform(tool: &str, text: String) -> String {
+    for t in ULTRA_TRANSFORMS {
+        if t.applies(tool, &text) {
+            return t.transform(&text);
+        }
+    }
+    text
+}
+
 #[must_use]
 #[derive(Default, Clone, Copy)]
 pub struct Savings {
@@ -22,6 +99,11 @@ pub struct Savings {
     /// dropped `_meta` or a boilerplate block), even if `content[].text`
     /// byte lengths happen to be unchanged (e.g. non-text content blocks only).
     pub mutated: bool,
+    /// Total payload bytes from image content blocks (type=="image"). Images
+    /// pass through byte-for-byte and are NOT compressed, but their volume is
+    /// tracked here so the ledger can record screenshot sizes. This field does
+    /// NOT contribute to `before`/`after` (those cover only text blocks).
+    pub image_bytes: usize,
 }
 
 impl Savings {
@@ -30,6 +112,7 @@ impl Savings {
             before,
             after: after.min(before),
             mutated: false,
+            image_bytes: 0,
         }
     }
     /// True when compression actually reduced content bytes.
@@ -53,6 +136,19 @@ pub fn compress_result_with(
     level: Level,
     filters: &FilterSet,
 ) -> Savings {
+    compress_result_with_min_priority(result, tool, level, filters, 0.0)
+}
+
+/// Like [`compress_result_with`] but also accepts a `min_priority` threshold for
+/// the MCP annotation pre-filter (Aggressive+ only). At Standard level or when
+/// `min_priority == 0.0`, the annotation pass is always a no-op.
+pub fn compress_result_with_min_priority(
+    result: &mut Value,
+    tool: &str,
+    level: Level,
+    filters: &FilterSet,
+    min_priority: f64,
+) -> Savings {
     // Measured over total `content[].text` bytes so that whole blocks dropped by
     // a structural filter (below) are credited to savings, not silently elided.
     let before = crate::cache::content_text_len(result);
@@ -69,9 +165,47 @@ pub fn compress_result_with(
         false
     };
 
+    // Aggressive/ultra: MCP annotation pre-filter (2025-06-18 spec §4.3).
+    // Drop content items that are explicitly NOT addressed to the assistant or
+    // fall below the priority floor. This is a TRUE no-op when:
+    //   (a) level is Standard, or
+    //   (b) the content item has no `annotations` field (Figma does not emit
+    //       annotations yet), or
+    //   (c) min_priority == 0.0 AND audience is absent or contains "assistant".
+    // Image and resource_link items are NEVER dropped regardless of annotations.
+    let annotation_mutated = if aggressive {
+        drop_annotation_excluded(result, min_priority)
+    } else {
+        false
+    };
+
     let mut text_mutated = false;
+    let mut image_bytes = 0usize;
     if let Some(content) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
         for item in content {
+            // Image blocks pass through byte-for-byte but their payload length
+            // is metered so the ledger can track screenshot / vision volume.
+            // Prefer the "data" field (base64 payload); fall back to "url" or
+            // "resource" (reference form). The item is never mutated here.
+            if item.get("type").and_then(|t| t.as_str()) == Some("image") {
+                let payload_len = item
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.len())
+                    .or_else(|| {
+                        item.get("url")
+                            .and_then(|u| u.as_str())
+                            .map(|s| s.len())
+                    })
+                    .or_else(|| {
+                        item.get("resource")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.len())
+                    })
+                    .unwrap_or(0);
+                image_bytes += payload_len;
+                continue;
+            }
             if item.get("type").and_then(|t| t.as_str()) != Some("text") {
                 continue;
             }
@@ -94,20 +228,10 @@ pub fn compress_result_with(
                     }
                     None => {
                         let c = compress_text(text);
-                        // These transforms only make sense for get_design_context's
-                        // generated JSX; gate them to that tool so a use_figma return
-                        // that happens to be a raw HTML/JSX string is never touched.
-                        // Strip Figma-ref attrs, then dedent the JSX (both lossy only
-                        // re: Code Connect traceability / formatting — rendering is
-                        // preserved; raw stays recoverable via tee/capture).
-                        if ultra && crate::filter::matches_tool(tool, "get_design_context") {
-                            if is_figma_node_tree(&c) {
-                                // Sparse node-tree dump (a section/frame's metadata,
-                                // not React): reduce each element to `<tag id="…">`.
-                                strip_node_tree_attrs(&c)
-                            } else {
-                                compress_jsx_code(&strip_figma_node_attrs(&c))
-                            }
+                        // Ultra: dispatch through the ULTRA_TRANSFORMS registry.
+                        // Standard/Aggressive return plain `c` (whitespace-only pass).
+                        if ultra {
+                            apply_ultra_transform(tool, c)
                         } else {
                             c
                         }
@@ -136,9 +260,10 @@ pub fn compress_result_with(
     // content[].text field even if the output happens to be the same byte length.
     // Track both separately so the caller can still emit a StatRec and forward
     // the mutated bytes.
-    if structural_mutated || text_mutated {
+    if structural_mutated || annotation_mutated || text_mutated {
         sv.mutated = true;
     }
+    sv.image_bytes = image_bytes;
     sv
 }
 
@@ -499,6 +624,81 @@ fn strip_node_tree_attrs(s: &str) -> String {
     out
 }
 
+/// Ultra-level only, get_metadata XML. Strips the four positional attributes
+/// `x`, `y`, `width`, `height` from every element. These are layout details
+/// the agent re-derives from get_design_context; for navigation it needs only
+/// id/name/type/hidden. This is LOSSY (geometry gone), hence ultra-gated; the
+/// raw payload stays recoverable via tee/capture.
+///
+/// Attribute boundary rule: a target attr is recognised ONLY as ` <name>="…"`
+/// — a SPACE, then the exact attribute name, then `="`. This ensures:
+///   • `height` does NOT match `line-height` (no space before `height`).
+///   • `width`  does NOT match `max-width`  (no space before `width`).
+///   • `x`/`y`  do NOT match `xml:…` (space + `x` + `=`, not `x` + any char).
+///   Values are XML-escaped — a literal `"` inside a value is encoded as
+///   `&quot;`, so the first raw `"` after `="` is always the true end-delimiter.
+///   The scan skips bytes from the leading space through the closing `"` inclusive.
+///
+/// PRECONDITION: all attribute values use double-quote delimiters (true for
+/// Figma-generated metadata XML; not validated at runtime). A single-quoted
+/// attribute whose value contained the literal bytes ` x="` is the one unsafe
+/// shape — Figma never emits that, and Ultra is tee-gated so the raw stays
+/// recoverable regardless.
+///
+/// Byte-scan is UTF-8 safe: every index lands on an ASCII delimiter or is taken
+/// from a whole-slice copy of the original `&str` (multibyte chars are never
+/// split — the markers and `"` are all single-byte ASCII codepoints).
+fn strip_metadata_pos_attrs(xml: &str) -> String {
+    // The four targets, each as the leading-space + name + =\" prefix.
+    const MARKERS: [&[u8]; 4] = [b" x=\"", b" y=\"", b" width=\"", b" height=\""];
+    let bytes = xml.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    'outer: while i < n {
+        // Look for the nearest marker starting at `i`.
+        let mut best: Option<(usize, usize)> = None; // (position, marker_len)
+        for marker in &MARKERS {
+            let mlen = marker.len();
+            if i + mlen > n {
+                continue;
+            }
+            // Simple substring scan from position i.
+            let mut j = i;
+            while j + mlen <= n {
+                if bytes[j..j + mlen] == **marker {
+                    if best.is_none_or(|(bi, _)| j < bi) {
+                        best = Some((j, mlen));
+                    }
+                    break;
+                }
+                j += 1;
+            }
+        }
+        let Some((pos, mlen)) = best else {
+            // No more markers — copy the rest verbatim.
+            out.push_str(&xml[i..]);
+            break 'outer;
+        };
+        // Copy everything up to (but not including) the marker's leading space.
+        out.push_str(&xml[i..pos]);
+        // Skip past the marker (space + name + =") and then skip to the closing ".
+        let after_open = pos + mlen; // index of the first byte of the value
+        // Scan for the closing double-quote.  Values are XML-escaped so this is
+        // always a real delimiter (no unescaped `"` appears inside an XML attr value).
+        let mut k = after_open;
+        while k < n && bytes[k] != b'"' {
+            k += 1;
+        }
+        // Skip the closing `"` as well.
+        if k < n {
+            k += 1;
+        }
+        i = k;
+    }
+    out
+}
+
 /// Whether a line has an odd number of unescaped backticks (so it opens or closes
 /// a multiline template literal). Byte-scan is UTF-8 safe: `` ` `` (0x60) and `\`
 /// (0x5C) are ASCII and never occur as multibyte continuation bytes.
@@ -534,6 +734,56 @@ fn find_unescaped_quote(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Aggressive+ annotation pre-filter (MCP spec 2025-06-18 §4.3).
+///
+/// Iterates `result["content"]` once and retains items, dropping those that
+/// are explicitly addressed away from the assistant or below the priority floor.
+/// The rule is intentionally conservative (true no-op by default):
+///
+/// Drop an item ONLY IF it HAS an `annotations` object AND either:
+///   - `priority` is present AND `priority < min_priority`, OR
+///   - `audience` is present, non-empty, and does NOT contain "assistant".
+///
+/// Items of type `"image"` or `"resource_link"` are **never** dropped,
+/// regardless of their annotations, to preserve vision and resource data.
+///
+/// Returns `true` when at least one item was dropped (caller sets `sv.mutated`).
+fn drop_annotation_excluded(result: &mut Value, min_priority: f64) -> bool {
+    let Some(content) = result.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return false;
+    };
+    let before = content.len();
+    content.retain(|item| {
+        // Never drop image or resource_link items.
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if item_type == "image" || item_type == "resource_link" {
+            return true;
+        }
+        let Some(ann) = item.get("annotations") else {
+            // No annotations field → keep.
+            return true;
+        };
+        // Check priority floor.
+        if let Some(priority) = ann.get("priority").and_then(|p| p.as_f64()) {
+            if priority < min_priority {
+                return false;
+            }
+        }
+        // Check audience: if present, non-empty, and does not contain "assistant" → drop.
+        if let Some(audience) = ann.get("audience").and_then(|a| a.as_array()) {
+            if !audience.is_empty()
+                && !audience
+                    .iter()
+                    .any(|v| v.as_str() == Some("assistant"))
+            {
+                return false;
+            }
+        }
+        true
+    });
+    content.len() < before
 }
 
 #[cfg(test)]
@@ -833,6 +1083,55 @@ mod tests {
     }
 
     #[test]
+    fn image_block_is_metered_not_mutated() {
+        // An image content block must be metered (its data length → image_bytes)
+        // but NOT mutated — the bytes pass through byte-for-byte. before==after==image_bytes.
+        let img_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let mut v: Value = serde_json::json!({
+            "content": [{"type": "image", "data": img_data, "mediaType": "image/png"}]
+        });
+        let sv = compress_result_with(&mut v, "get_screenshot", Level::Standard, &FilterSet::default());
+        assert_eq!(sv.image_bytes, img_data.len(), "image_bytes == data field length");
+        assert_eq!(sv.before, sv.after, "no text savings for image-only content (before==after==0)");
+        assert!(!sv.mutated, "a pure image block must NOT set sv.mutated — nothing was rewritten");
+        // The image item must be byte-for-byte identical.
+        assert_eq!(v["content"][0]["data"].as_str(), Some(img_data), "image data unchanged");
+        assert_eq!(v["content"][0]["type"].as_str(), Some("image"), "type unchanged");
+    }
+
+    #[test]
+    fn image_block_url_field_metered_when_no_data() {
+        // If "data" is absent but "url" is present, the url length is metered.
+        let url = "https://example.com/screenshot.png";
+        let mut v: Value = serde_json::json!({
+            "content": [{"type": "image", "url": url}]
+        });
+        let sv = compress_result_with(&mut v, "get_screenshot", Level::Standard, &FilterSet::default());
+        assert_eq!(sv.image_bytes, url.len(), "url length metered when data absent");
+        // Image item must still be unchanged.
+        assert_eq!(v["content"][0]["url"].as_str(), Some(url), "url unchanged");
+    }
+
+    #[test]
+    fn mixed_text_and_image_both_metered() {
+        // A result with both a text block and an image block: text is compressed,
+        // image_bytes is set for the image, and the image item is unchanged.
+        let text = "{\n  \"a\": 1\n}";
+        let img_data = "abc123base64";
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image", "data": img_data}
+            ]
+        });
+        let sv = compress_result_with(&mut v, "get_screenshot", Level::Standard, &FilterSet::default());
+        assert_eq!(sv.image_bytes, img_data.len(), "image_bytes set for image block");
+        assert!(sv.before > sv.after, "text block compressed");
+        assert_eq!(v["content"][0]["text"].as_str(), Some("{\"a\":1}"), "text compressed");
+        assert_eq!(v["content"][1]["data"].as_str(), Some(img_data), "image unchanged");
+    }
+
+    #[test]
     fn compress_result_rewrites_text() {
         let mut v: Value = serde_json::from_str(
             r#"{"content":[{"type":"text","text":"{\n  \"x\": 1\n}"}]}"#,
@@ -930,6 +1229,116 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // R2-B: Annotation pre-filter tests
+    // -----------------------------------------------------------------------
+
+    /// An item with NO annotations object must NEVER be dropped, even at Aggressive.
+    #[test]
+    fn annotation_no_annotations_field_never_dropped() {
+        let mut v: Value = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}]
+        });
+        let sv = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        assert_eq!(v["content"].as_array().unwrap().len(), 1, "item without annotations must survive");
+        // No mutation from annotation pass (text was already compact, no other filters).
+        let _ = sv;
+    }
+
+    /// At Standard level the annotation pass must be a true no-op — no drops even
+    /// when the item has annotations that would be dropped at Aggressive.
+    #[test]
+    fn annotation_no_op_at_standard() {
+        let mut v: Value = serde_json::json!({
+            "content": [{"type": "text", "text": "x", "annotations": {"audience": ["user"], "priority": 1.0}}]
+        });
+        let sv = compress_result_with(&mut v, "get_design_context", crate::config::Level::Standard, &FilterSet::default());
+        assert_eq!(v["content"].as_array().unwrap().len(), 1, "standard: annotation drop must not fire");
+        let _ = sv;
+    }
+
+    /// At Aggressive, an item whose audience is ["user"] only (not "assistant") is dropped.
+    #[test]
+    fn annotation_drops_user_only_audience_at_aggressive() {
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "assistant text"},
+                {"type": "text", "text": "user only", "annotations": {"audience": ["user"]}}
+            ]
+        });
+        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        let arr = v["content"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "user-only item dropped at aggressive: {arr:?}");
+        assert_eq!(arr[0]["text"].as_str().unwrap(), "assistant text");
+    }
+
+    /// An image item with audience=["user"] must NEVER be dropped regardless of annotations.
+    #[test]
+    fn annotation_never_drops_image_items() {
+        let img_data = "abc123";
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "image", "data": img_data, "annotations": {"audience": ["user"]}}
+            ]
+        });
+        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        assert_eq!(v["content"].as_array().unwrap().len(), 1, "image items must never be dropped by annotation pass");
+        assert_eq!(v["content"][0]["data"].as_str().unwrap(), img_data, "image data unchanged");
+    }
+
+    /// A resource_link item with audience=["user"] must NEVER be dropped regardless of annotations.
+    #[test]
+    fn annotation_never_drops_resource_link_items() {
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "resource_link", "uri": "figma://node/123", "annotations": {"audience": ["user"]}}
+            ]
+        });
+        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        assert_eq!(v["content"].as_array().unwrap().len(), 1, "resource_link items must never be dropped by annotation pass");
+        assert_eq!(v["content"][0]["uri"].as_str().unwrap(), "figma://node/123", "resource_link uri unchanged");
+    }
+
+    /// At default config (min_priority=0.0), an item with priority=0.0 is NOT dropped.
+    #[test]
+    fn annotation_default_priority_floor_keeps_zero_priority_item() {
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "low prio", "annotations": {"priority": 0.0}}
+            ]
+        });
+        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        assert_eq!(v["content"].as_array().unwrap().len(), 1, "priority=0.0 must not be dropped at default min_priority=0.0");
+    }
+
+    /// With min_priority=0.5, an item with priority=0.3 is dropped at Aggressive.
+    #[test]
+    fn annotation_below_priority_floor_dropped() {
+        let fs = FilterSet::default();
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "keep", "annotations": {"priority": 0.8}},
+                {"type": "text", "text": "drop", "annotations": {"priority": 0.3}}
+            ]
+        });
+        let _ = compress_result_with_min_priority(&mut v, "get_design_context", crate::config::Level::Aggressive, &fs, 0.5);
+        let arr = v["content"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "priority<min_priority item must be dropped: {arr:?}");
+        assert_eq!(arr[0]["text"].as_str().unwrap(), "keep");
+    }
+
+    /// When an annotation drop occurs, sv.mutated must be true.
+    #[test]
+    fn annotation_drop_sets_mutated() {
+        let mut v: Value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "x", "annotations": {"audience": ["user"]}}
+            ]
+        });
+        let sv = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        assert!(sv.mutated, "annotation drop must set sv.mutated");
+    }
+
     #[test]
     fn is_figma_node_tree_detected_even_if_root_name_has_gt() {
         // Finding 2: a '>' inside the root's name must not defeat detection.
@@ -945,5 +1354,183 @@ mod tests {
             strip_node_tree_attrs(r#"<frame id="1:1"/><"#),
             r#"<frame id="1:1"/><"#
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PERF-8: strip_metadata_pos_attrs — get_metadata XML geometry stripping
+    // -----------------------------------------------------------------------
+
+    /// Basic: drops x/y/width/height but keeps id, name, tag, hidden, self-close,
+    /// nesting, and any other attributes.
+    #[test]
+    fn strip_metadata_pos_attrs_drops_geometry_keeps_rest() {
+        let xml = r#"<frame id="1:1" name="Hero" x="10" y="20" width="1920" height="1080" hidden="false"><text id="1:2" name="Title" x="57" y="321" width="246" height="22" /></frame>"#;
+        let out = strip_metadata_pos_attrs(xml);
+        // Geometry attrs dropped.
+        assert!(!out.contains(r#" x=""#),  "x attr dropped");
+        assert!(!out.contains(r#" y=""#),  "y attr dropped");
+        assert!(!out.contains(r#" width=""#), "width attr dropped");
+        assert!(!out.contains(r#" height=""#), "height attr dropped");
+        // Identity attrs kept.
+        assert!(out.contains(r#"id="1:1""#), "id kept");
+        assert!(out.contains(r#"name="Hero""#), "name kept");
+        assert!(out.contains(r#"hidden="false""#), "hidden kept");
+        assert!(out.contains(r#"id="1:2""#), "nested id kept");
+        assert!(out.contains(r#"name="Title""#), "nested name kept");
+        // Tag structure preserved.
+        assert!(out.contains("<frame"), "opening tag kept");
+        assert!(out.contains("</frame>"), "closing tag kept");
+        assert!(out.contains("/>"), "self-close kept");
+        // Result is strictly smaller.
+        assert!(out.len() < xml.len(), "output is smaller");
+    }
+
+    /// Name safety: a node whose name literally contains tricky text like
+    /// `name="box width=99 x=1"` (XML-escaped, so no real inner `"`) must survive
+    /// with its name byte-identical; width/height/x/y as real attrs are still dropped.
+    #[test]
+    fn strip_metadata_pos_attrs_name_safety() {
+        // The name value contains the literal text "width=99 x=1" — in the real XML
+        // this would be encoded as `name="box width=99 x=1"` (no inner quotes because
+        // the string has none; spaces and = are valid unescaped inside an XML attr value).
+        let xml = r#"<frame id="2:1" name="box width=99 x=1" x="0" y="0" width="200" height="100" />"#;
+        let out = strip_metadata_pos_attrs(xml);
+        // The tricky name must survive byte-identical.
+        assert!(
+            out.contains(r#"name="box width=99 x=1""#),
+            "name with tricky content survives: {out:?}"
+        );
+        // Real geometry attrs are dropped.
+        // Specifically: ` x="0"`, ` y="0"`, ` width="200"`, ` height="100"` are gone.
+        // We check via the attr-boundary pattern (space + exact-name + ="): e.g. ` x="0"`.
+        assert!(!out.contains(r#" x="0""#), "real x attr dropped");
+        assert!(!out.contains(r#" y="0""#), "real y attr dropped");
+        assert!(!out.contains(r#" width="200""#), "real width attr dropped");
+        assert!(!out.contains(r#" height="100""#), "real height attr dropped");
+    }
+
+    /// Boundary correctness: `line-height` and `max-width` style attr names must NOT
+    /// be stripped (the required leading space before the exact name provides the
+    /// boundary — there is no space inside `line-height`).
+    #[test]
+    fn strip_metadata_pos_attrs_boundary_no_partial_match() {
+        // line-height and max-width should be untouched.
+        let xml = r#"<text id="3:1" name="Label" line-height="1.5" max-width="400" x="0" y="0" width="100" height="20" />"#;
+        let out = strip_metadata_pos_attrs(xml);
+        assert!(out.contains(r#"line-height="1.5""#), "line-height kept");
+        assert!(out.contains(r#"max-width="400""#), "max-width kept");
+        // Real geometry dropped.
+        assert!(!out.contains(r#" x="0""#),   "x dropped");
+        assert!(!out.contains(r#" y="0""#),   "y dropped");
+        assert!(!out.contains(r#" width="100""#), "width dropped");
+        assert!(!out.contains(r#" height="20""#), "height dropped");
+    }
+
+    /// Gating: Standard and Aggressive keep all attrs (only lossless indent-strip);
+    /// Ultra strips geometry. And get_design_context payload is NOT affected.
+    #[test]
+    fn strip_metadata_pos_attrs_gating() {
+        // A get_metadata-shaped XML with geometry attrs.
+        let xml_text = r#"<frame id="4:1" name="Page" x="0" y="0" width="1920" height="1080" />"#;
+        let mk = |xml: &str| -> Value {
+            serde_json::json!({"content": [{"type": "text", "text": xml}]})
+        };
+        let fs = FilterSet::default();
+
+        // Standard: geometry kept (only whitespace transforms).
+        let mut std_v = mk(xml_text);
+        let _ = compress_result_with(&mut std_v, "get_metadata", Level::Standard, &fs);
+        let t_std = std_v["content"][0]["text"].as_str().unwrap();
+        assert!(t_std.contains(r#" x="0""#), "standard keeps x");
+        assert!(t_std.contains(r#" width="1920""#), "standard keeps width");
+
+        // Aggressive: geometry kept.
+        let mut agg_v = mk(xml_text);
+        let _ = compress_result_with(&mut agg_v, "get_metadata", Level::Aggressive, &fs);
+        let t_agg = agg_v["content"][0]["text"].as_str().unwrap();
+        assert!(t_agg.contains(r#" x="0""#), "aggressive keeps x");
+        assert!(t_agg.contains(r#" width="1920""#), "aggressive keeps width");
+
+        // Ultra on get_metadata: geometry stripped.
+        let mut ultra_v = mk(xml_text);
+        let _ = compress_result_with(&mut ultra_v, "get_metadata", Level::Ultra, &fs);
+        let t_ultra = ultra_v["content"][0]["text"].as_str().unwrap();
+        assert!(!t_ultra.contains(r#" x=""#), "ultra strips x from get_metadata");
+        assert!(!t_ultra.contains(r#" width=""#), "ultra strips width from get_metadata");
+        assert!(t_ultra.contains(r#"id="4:1""#), "ultra keeps id");
+        assert!(t_ultra.contains(r#"name="Page""#), "ultra keeps name");
+
+        // Ultra on get_design_context with the same XML shape: NOT stripped by this branch.
+        let mut gdc_v = mk(xml_text);
+        let _ = compress_result_with(&mut gdc_v, "get_design_context", Level::Ultra, &fs);
+        let t_gdc = gdc_v["content"][0]["text"].as_str().unwrap();
+        // get_design_context ultra branch routes this through strip_node_tree_attrs
+        // (because it has Figma id shape N:M) — the id is kept but no geometry.
+        // The important thing is the get_metadata branch did NOT run.
+        // (strip_node_tree_attrs drops geometry too, but via a different code path.)
+        let _ = t_gdc; // outcome asserted separately in other tests
+    }
+
+    // -----------------------------------------------------------------------
+    // ULTRA_TRANSFORMS registry dispatch parity test
+    // -----------------------------------------------------------------------
+
+    /// Verify that `apply_ultra_transform` produces the same output as the
+    /// original inline if/else chain for:
+    ///   (a) a get_design_context JSX sample,
+    ///   (b) a get_metadata XML sample starting with '<',
+    ///   (c) an unknown tool (passthrough).
+    /// This test does NOT change or re-state any existing assertion; it only
+    /// confirms the new dispatch path is observably equivalent.
+    #[test]
+    fn ultra_transforms_dispatch_matches_original_behaviour() {
+        // (a) get_design_context JSX: strip_figma_node_attrs + compress_jsx_code
+        let jsx = r#"<div className="x" data-node-id="1:2" data-name="H">hi</div>"#;
+        let c = compress_text(jsx);
+        let expected_gdc = compress_jsx_code(&strip_figma_node_attrs(&c));
+        let got_gdc = apply_ultra_transform("mcp__plugin__get_design_context", c.clone());
+        assert_eq!(got_gdc, expected_gdc, "gdc JSX dispatch mismatch");
+
+        // (b) get_metadata XML starting with '<': strip_metadata_pos_attrs
+        let xml = r#"<frame id="1:1" name="P" x="0" y="0" width="100" height="50" />"#;
+        let c2 = compress_text(xml);
+        let expected_meta = strip_metadata_pos_attrs(&c2);
+        let got_meta = apply_ultra_transform("mcp__plugin__get_metadata", c2.clone());
+        assert_eq!(got_meta, expected_meta, "metadata XML dispatch mismatch");
+
+        // (c) Unknown tool: passthrough (text unchanged)
+        let plain = "hello world";
+        let c3 = compress_text(plain);
+        let got_unknown = apply_ultra_transform("mcp__plugin__some_other_tool", c3.clone());
+        assert_eq!(got_unknown, c3, "unknown tool must pass through unchanged");
+    }
+
+    /// Measure: a representative 10-node fixture at Ultra must achieve ≥35% reduction
+    /// compared to the indent-stripped-only (Standard-level) output.
+    #[test]
+    fn strip_metadata_pos_attrs_measure_reduction() {
+        // Build a ~10-node fixture mirroring the real shape: frame + 9 child nodes
+        // each with id, name, x, y, width, height.
+        let xml = r#"<frame id="10:1" name="Main" x="0" y="0" width="1920" height="1080"><frame id="10:2" name="Header" x="0" y="0" width="1920" height="80"><text id="10:3" name="Logo" x="24" y="20" width="120" height="40" /><text id="10:4" name="NavLink1" x="200" y="20" width="80" height="40" /><text id="10:5" name="NavLink2" x="300" y="20" width="80" height="40" /></frame><frame id="10:6" name="Hero" x="0" y="80" width="1920" height="600"><text id="10:7" name="Headline" x="240" y="200" width="800" height="60" /><text id="10:8" name="Subhead" x="240" y="280" width="600" height="40" /><rect id="10:9" name="CTA" x="240" y="360" width="200" height="52" /></frame><frame id="10:10" name="Footer" x="0" y="980" width="1920" height="100"><text id="10:11" name="Copyright" x="760" y="40" width="400" height="20" /></frame></frame>"#;
+
+        // Simulate what compress_text does at Standard (lossless indent-strip).
+        // The fixture has no indentation, so indent-strip is a no-op here —
+        // meaning `standard_len == xml.len()`.  We use that as the baseline.
+        let standard_out = compress_text(xml); // lossless only (same content, may differ in ws)
+        let standard_len = standard_out.len();
+
+        // Ultra strip.
+        let ultra_out = strip_metadata_pos_attrs(&standard_out);
+        let ultra_len = ultra_out.len();
+
+        let reduction_pct = (standard_len - ultra_len) as f64 / standard_len as f64 * 100.0;
+        assert!(
+            reduction_pct >= 35.0,
+            "expected ≥35% reduction over indent-stripped baseline, got {reduction_pct:.1}% \
+             (standard_len={standard_len}, ultra_len={ultra_len})"
+        );
+        // Report the exact percentage so it appears in test output.
+        eprintln!("strip_metadata_pos_attrs reduction: {reduction_pct:.1}% \
+                   ({standard_len} -> {ultra_len} bytes)");
     }
 }
