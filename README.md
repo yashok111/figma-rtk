@@ -25,6 +25,46 @@ the response before it reaches the agent.
   `text/event-stream` (SSE) responses.
 - **`gain` meter** — RTK-style token-savings accounting.
 
+## Compression on real data
+
+Measured against a real Figma file — a full landing-page mockup ("Good Vibez", a
+dance-studio site; 2 164 nodes). Raw upstream bodies were captured from `frtk
+serve`'s `tee`, then re-run through `frtk compress` at each level — so the
+numbers are reproducible from the captured payload, not estimated.
+
+**Savings scale with payload size and level.** The big wins are on the large
+structural reads you actually do when implementing a page, at `ultra`:
+
+| read                                   | payload | standard | aggressive | ultra            |
+|----------------------------------------|--------:|---------:|-----------:|------------------|
+| `get_metadata` — **whole page**        | 564 KB  | 14.1 %   | 14.1 %     | **54.1 %** (~76 K tok) |
+| `get_metadata` — one node (Hero)       | 4.8 KB  |  5.6 %   |  5.6 %     | 44.6 % (~533 tok) |
+| `get_design_context` — one section     | 11.9 KB |  0.0 %   |  9.5 %     | 28.6 % (~851 tok) |
+
+Peak observed in real use (`frtk gain` ledger): a `get_design_context` node-tree
+of **453 KB → 99 KB = 78 %**. Across 164 mixed read calls the ledger totals
+**659,675 → 443,535 tokens (~216 K saved)** — screenshot calls count as byte
+volume, not token savings, so they show 0.
+
+Why the spread:
+
+- **`standard`** is whitespace-only (near-lossless): JSON minified, XML
+  indentation stripped. It moves a big indented XML dump ~14 %, but barely
+  touches an already-compact code blob.
+- **`aggressive`** adds the project filter — for `get_design_context` it drops
+  the boilerplate `content[]` instruction blocks + `_meta`. `get_metadata` has
+  no aggressive filter, so its `aggressive` equals `standard`.
+- **`ultra`** also strips node position/size attributes from the metadata XML —
+  the single biggest lever on large structural reads (lossy, but the raw body
+  stays recoverable via `tee`).
+
+Reproduce from a captured body:
+
+```bash
+grep '^data: ' get_metadata.raw | sed 's/^data: //' \
+  | frtk compress --tool get_metadata --level ultra >/dev/null
+```
+
 ## Usage
 
 ```bash
