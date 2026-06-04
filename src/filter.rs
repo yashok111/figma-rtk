@@ -171,6 +171,7 @@ impl FilterSet {
 /// name carries an MCP namespace prefix ending in `__<tool>`. The `__` boundary
 /// stops a short name like "a" or "metadata" matching "get_metadata".
 /// Zero-alloc: no heap allocation; uses `strip_suffix` + a slice check.
+#[must_use]
 pub(crate) fn matches_tool(wire: &str, filter_tool: &str) -> bool {
     wire == filter_tool
         || wire
@@ -240,6 +241,7 @@ pub struct TestResult {
 }
 
 /// Run every filter's inline tests.
+#[must_use]
 pub fn run_tests(filters: &[Filter]) -> Vec<TestResult> {
     let mut out = Vec::new();
     for f in filters {

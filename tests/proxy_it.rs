@@ -498,8 +498,17 @@ async fn delta_cache_collapses_identical_reread() {
     std::env::set_var("FRTK_LEDGER", base.join("ledger.jsonl"));
 
     let upstream = spawn_mock(rpc_response_envelope(), "application/json").await;
-    let mut state = proxy::build_state(&upstream, None).unwrap();
-    state.set_delta_cache(Some(Arc::new(cache::DeltaCache::new(8))));
+    let state = proxy::build_state_with(
+        &upstream,
+        None,
+        figma_rtk::config::TeeMode::Never,
+        None,
+        figma_rtk::config::Level::Standard,
+        figma_rtk::filter::FilterSet::default(),
+        Some(Arc::new(cache::DeltaCache::new(8))),
+        Vec::new(),
+    )
+    .unwrap();
     let app = proxy::app(state);
 
     // First read: full (compressed) content.
@@ -550,8 +559,17 @@ async fn exclude_tools_namespaced_wire_name_passes_through() {
 
     // Build state with exclude_tools=["get_metadata"] so the bare name excludes
     // the namespaced wire call.
-    let mut state = proxy::build_state(&upstream, None).unwrap();
-    state.set_exclude_tools(vec!["get_metadata".to_string()]);
+    let state = proxy::build_state_with(
+        &upstream,
+        None,
+        figma_rtk::config::TeeMode::Never,
+        None,
+        figma_rtk::config::Level::Standard,
+        figma_rtk::filter::FilterSet::default(),
+        None,
+        vec!["get_metadata".to_string()],
+    )
+    .unwrap();
 
     // Send a request using the NAMESPACED wire name.
     let namespaced_req = serde_json::json!({
@@ -593,6 +611,345 @@ async fn exclude_tools_namespaced_wire_name_passes_through() {
     assert!(
         ledger_content.trim().is_empty(),
         "ledger must be empty for excluded tool, got: {ledger_content:?}"
+    );
+
+    std::env::remove_var("FRTK_LEDGER");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// COV-3: GET /mcp SSE stream passes through byte-identical
+// ---------------------------------------------------------------------------
+
+/// Spawn a mock upstream that responds to GET /mcp with an SSE stream.
+async fn spawn_get_mock(body: String, ctype: &'static str) -> String {
+    let router = Router::new().route(
+        "/mcp",
+        axum::routing::get(move || {
+            let body = body.clone();
+            async move {
+                axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, ctype)
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// A GET /mcp (the long-lived server->client SSE notification channel) must be
+/// forwarded byte-for-byte — the proxy must NOT buffer or transform it.
+#[tokio::test]
+async fn get_mcp_stream_passes_through_verbatim() {
+    let sse_body = "event: ping\ndata: {\"type\":\"ping\"}\n\nevent: message\ndata: {\"id\":1}\n\n";
+    let upstream = spawn_get_mock(sse_body.to_string(), "text/event-stream").await;
+    let state = proxy::build_state(&upstream, None).unwrap();
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/mcp")
+        .body(Body::empty())
+        .unwrap();
+    let resp = proxy::app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        sse_body.as_bytes(),
+        "GET /mcp SSE stream must be byte-identical"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// COV-4: Aggressive level applies filters through the proxy
+// ---------------------------------------------------------------------------
+
+/// When the proxy state is configured with Aggressive level + a drop_where
+/// filter, the dropped content block must be absent in the response.
+#[tokio::test]
+async fn aggressive_level_applies_filters_through_proxy() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-agg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::env::set_var("FRTK_LEDGER", base.join("ledger.jsonl"));
+
+    // Build a response with a code block + a boilerplate block matching drop_where.
+    let upstream_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "content": [
+                {"type": "text", "text": "export default function Hero() { return null; }"},
+                {"type": "text", "text": "BOILERPLATE: this text should be dropped by the filter"}
+            ]
+        }
+    })
+    .to_string();
+
+    let filters = figma_rtk::filter::FilterSet::parse(
+        "[[filter]]\nname=\"dc\"\ntools=[\"get_design_context\"]\n\
+         drop_where=[{key=\"text\",starts_with=\"BOILERPLATE\"}]\n",
+    )
+    .unwrap();
+
+    let upstream = spawn_mock(upstream_body, "application/json").await;
+    let state = proxy::build_state_with(
+        &upstream,
+        None,
+        figma_rtk::config::TeeMode::Never,
+        None,
+        figma_rtk::config::Level::Aggressive,
+        filters,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let body = post_through_proxy(state).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let out = serde_json::to_string(&v).unwrap();
+
+    assert!(
+        !out.contains("BOILERPLATE"),
+        "dropped block must be absent at Aggressive level: {out}"
+    );
+    assert!(
+        out.contains("export default function Hero"),
+        "code block must survive: {out}"
+    );
+
+    std::env::remove_var("FRTK_LEDGER");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// COV-5: Tee writes raw body to dir
+// ---------------------------------------------------------------------------
+
+/// When TeeMode::Always is set, the raw upstream body must be written to the
+/// tee dir under `<tool>.raw`, and its content must equal the raw mock body.
+#[tokio::test]
+async fn tee_writes_raw_body_to_dir() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-tee-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let tee_dir = base.join("tee");
+
+    let upstream = spawn_mock(rpc_response_envelope(), "application/json").await;
+    let state = proxy::build_state_with(
+        &upstream,
+        None,
+        figma_rtk::config::TeeMode::Always,
+        Some(tee_dir.clone()),
+        figma_rtk::config::Level::Standard,
+        figma_rtk::filter::FilterSet::default(),
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let _ = post_through_proxy(state).await;
+
+    // The tee dir must contain exactly one file named after the tool.
+    let entries: Vec<_> = std::fs::read_dir(&tee_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "tee dir must contain exactly one file");
+
+    // The file must be byte-identical to the raw upstream body (pre-compression).
+    let raw = std::fs::read_to_string(entries[0].path()).unwrap();
+    assert_eq!(raw, rpc_response_envelope(), "tee file must be byte-identical to the raw upstream body");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// COV-7: Batch request compresses target, passes non-target
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC batch containing a target tool + a non-target tool: the target
+/// result is compressed (and a ledger entry written), the non-target result is
+/// passed through unchanged, and EXACTLY ONE ledger line is written.
+#[tokio::test]
+async fn batch_request_compresses_target_and_passes_nontarget() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-batch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let ledger = base.join("ledger.jsonl");
+    std::env::set_var("FRTK_LEDGER", &ledger);
+
+    // Batch response: id=1 is get_design_context (target, pretty inner text),
+    // id=2 is whoami (non-target, compact plain text).
+    let non_target_text = "non-target plain text";
+    let batch_resp = serde_json::json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "content": [{ "type": "text", "text": inner_pretty() }] }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "content": [{ "type": "text", "text": non_target_text }] }
+        }
+    ])
+    .to_string();
+
+    let upstream = spawn_mock(batch_resp, "application/json").await;
+    let state = proxy::build_state(&upstream, None).unwrap();
+
+    // Batch request: id=1 calls get_design_context (target), id=2 calls whoami (non-target).
+    let batch_req = serde_json::json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_design_context", "arguments": {} }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "whoami", "arguments": {} }
+        }
+    ])
+    .to_string();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(batch_req))
+        .unwrap();
+    let resp = proxy::app(state).oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v.as_array().expect("response must be a batch array");
+    assert_eq!(arr.len(), 2, "both responses present");
+
+    // Find id=1 (target) and id=2 (non-target) in the response array.
+    let target_resp = arr.iter().find(|m| m["id"] == 1).expect("id=1 present");
+    let nontarget_resp = arr.iter().find(|m| m["id"] == 2).expect("id=2 present");
+
+    // Target: content text must be minified.
+    let target_text = target_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        target_text, EXPECT_MIN,
+        "target result must be minified"
+    );
+
+    // Non-target: content text must be unchanged.
+    let nt_text = nontarget_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        nt_text, non_target_text,
+        "non-target result must be unchanged"
+    );
+
+    // Exactly 1 ledger line (only the target tool was compressed).
+    let ledger_content = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let ledger_lines: Vec<&str> = ledger_content.lines().collect();
+    assert_eq!(
+        ledger_lines.len(),
+        1,
+        "EXACTLY 1 ledger line for the single target tool, got: {ledger_content:?}"
+    );
+    assert!(
+        ledger_content.contains("get_design_context"),
+        "ledger must name the target tool"
+    );
+
+    std::env::remove_var("FRTK_LEDGER");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// COV-8: Oversized REQUEST body returns 502
+// ---------------------------------------------------------------------------
+
+/// A POST whose body exceeds MAX_REQ_BODY (32 MiB) must produce 502 — this is
+/// the REQUEST-side cap, distinct from the RESPONSE-side cap tested in
+/// `oversized_response_body_returns_502`.
+#[tokio::test]
+async fn oversized_request_body_returns_502() {
+    // Any upstream will do — the proxy must reject the request before sending it.
+    let upstream = spawn_mock("{}".to_string(), "application/json").await;
+    let state = proxy::build_state(&upstream, None).unwrap();
+
+    // Build a body 1 byte over MAX_REQ_BODY (32 MiB + 1).
+    let over_limit = proxy::MAX_REQ_BODY + 1;
+    let big_body = vec![b'x'; over_limit];
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(big_body))
+        .unwrap();
+    let resp = proxy::app(state).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "oversized request body must yield 502"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// COV-complement: already-compact content produces no ledger entry
+// ---------------------------------------------------------------------------
+
+/// Already-compact content (no whitespace to remove, no filter applied) must
+/// NOT produce a ledger entry — this is the proxy-level complement of the
+/// mcp::tests::no_stat_rec_for_already_compact_json unit test (CORR-3).
+#[tokio::test]
+async fn already_compact_content_produces_no_ledger_entry() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-compact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let ledger = base.join("ledger.jsonl");
+    std::env::set_var("FRTK_LEDGER", &ledger);
+
+    // A target-tool response whose inner text is already compact JSON.
+    let compact_text = r#"{"a":1,"b":2}"#;
+    let upstream_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "content": [{ "type": "text", "text": compact_text }] }
+    })
+    .to_string();
+
+    let upstream = spawn_mock(upstream_body, "application/json").await;
+    let state = proxy::build_state(&upstream, None).unwrap();
+
+    let body = post_through_proxy(state).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, compact_text, "already-compact content must pass through unchanged");
+
+    // No ledger entry must have been written.
+    let ledger_content = std::fs::read_to_string(&ledger).unwrap_or_default();
+    assert!(
+        ledger_content.trim().is_empty(),
+        "no ledger entry for already-compact content, got: {ledger_content:?}"
     );
 
     std::env::remove_var("FRTK_LEDGER");

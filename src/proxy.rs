@@ -44,7 +44,8 @@ const RESP_HOP_BY_HOP: &[&str] = &[
 ];
 
 /// Max request body we will buffer (tool-call params are tiny; this is a guard).
-const MAX_REQ_BODY: usize = 32 * 1024 * 1024;
+/// Exposed `pub` so integration tests can reference it (e.g. `oversized_request_body_returns_502`).
+pub const MAX_REQ_BODY: usize = 32 * 1024 * 1024;
 
 /// Max upstream response body we will buffer. Content-Length is advisory and
 /// can be absent or lie; we accumulate with a cap to prevent OOM / DoS.
@@ -100,27 +101,56 @@ impl AppState {
 
 /// Build proxy state. `capture_dir`, when set, enables fixture capture of
 /// target tool responses (raw body only — never headers/token). Tee defaults
-/// to off; use [`build_state_with`] to enable it.
+/// to off, level defaults to Standard, no filters/delta-cache/exclude-tools.
+/// Use [`build_state_with`] to configure all options in one call.
 pub fn build_state(upstream: &str, capture_dir: Option<PathBuf>) -> anyhow::Result<AppState> {
-    build_state_with(upstream, capture_dir, TeeMode::Never, None)
+    build_state_with(
+        upstream,
+        capture_dir,
+        TeeMode::Never,
+        None,
+        Level::Standard,
+        FilterSet::default(),
+        None,
+        Vec::new(),
+    )
 }
 
-/// As [`build_state`], plus raw-payload recovery (tee) settings.
+/// Build proxy state with full configuration in a single call, eliminating the
+/// implicit call-ordering contract of the former post-construction mutators
+/// (`set_filters`, `set_delta_cache`, `set_exclude_tools`).
+///
+/// * `tee_mode` / `tee_dir` — raw-payload recovery.
+/// * `level` / `filters` — compression level and trusted TOML filter set.
+/// * `delta_cache` — opt-in delta cache (pass `None` to disable).
+/// * `exclude_tools` — bare tool names to skip compression for.
+///
 /// Uses the default connect and read timeouts.
+// This is a documented config constructor; the 8-arg count is intentional.
+#[allow(clippy::too_many_arguments)]
 pub fn build_state_with(
     upstream: &str,
     capture_dir: Option<PathBuf>,
     tee_mode: TeeMode,
     tee_dir: Option<PathBuf>,
+    level: Level,
+    filters: FilterSet,
+    delta_cache: Option<Arc<DeltaCache>>,
+    exclude_tools: Vec<String>,
 ) -> anyhow::Result<AppState> {
-    build_state_with_timeouts(
+    let mut state = build_state_with_timeouts(
         upstream,
         capture_dir,
         tee_mode,
         tee_dir,
         DEFAULT_CONNECT_TIMEOUT,
         DEFAULT_READ_TIMEOUT,
-    )
+    )?;
+    state.level = level;
+    state.filters = Arc::new(filters);
+    state.delta_cache = delta_cache;
+    state.exclude_tools = exclude_tools;
+    Ok(state)
 }
 
 /// As [`build_state_with`], but with explicit connect and read timeouts.
@@ -176,14 +206,17 @@ pub async fn serve(
     }
     let filters = load_filters();
     let filter_count = filters.len();
-    let mut state = build_state_with(upstream, capture_dir, cfg.tee.mode, tee_dir)?;
-    state.set_filters(level, filters);
-    if cfg.cache.delta {
-        state.set_delta_cache(Some(Arc::new(DeltaCache::new(256))));
-    }
-    if !cfg.exclude_tools.is_empty() {
-        state.set_exclude_tools(cfg.exclude_tools.clone());
-    }
+    let delta_cache = cfg.cache.delta.then(|| Arc::new(DeltaCache::new(256)));
+    let state = build_state_with(
+        upstream,
+        capture_dir,
+        cfg.tee.mode,
+        tee_dir,
+        level,
+        filters,
+        delta_cache,
+        cfg.exclude_tools.clone(),
+    )?;
     let app = app(state);
 
     tracing::info!(
@@ -245,7 +278,7 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     let mut target_ids = if method == Method::POST {
         crate::mcp::extract_targets(&body_bytes)
     } else {
-        Default::default()
+        std::collections::HashMap::new()
     };
 
     // Drop any target whose tool name matches an entry in exclude_tools. The
@@ -412,8 +445,7 @@ fn buffered_bytes(status: StatusCode, h: &HeaderMap, body: Bytes) -> Response {
 async fn collect_capped(mut resp: reqwest::Response, cap: usize) -> anyhow::Result<Bytes> {
     let hint = resp
         .content_length()
-        .map(|n| (n as usize).min(cap))
-        .unwrap_or(0);
+        .map_or(0, |n| (n as usize).min(cap));
     let mut buf: Vec<u8> = Vec::with_capacity(hint);
 
     while let Some(chunk) = resp.chunk().await? {

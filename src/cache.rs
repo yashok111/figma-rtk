@@ -30,6 +30,7 @@ pub struct DeltaCache {
 }
 
 impl DeltaCache {
+    #[must_use]
     pub fn new(cap: usize) -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
@@ -82,23 +83,24 @@ impl DeltaCache {
 }
 
 /// Sum of the byte lengths of all `content[].text` fields in a tool result.
+#[must_use]
 pub fn content_text_len(result: &Value) -> usize {
     result
         .get("content")
         .and_then(|c| c.as_array())
-        .map(|arr| {
+        .map_or(0, |arr| {
             arr.iter()
                 .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
                 .map(str::len)
                 .sum()
         })
-        .unwrap_or(0)
 }
 
 /// If this `result` is byte-identical to the previous one for `key`, replace its
 /// content with a sentinel and return the sentinel byte size; otherwise return
 /// `None` and leave the result untouched. `original_bytes` is the pre-compression
 /// content size, used only for the human-readable "bytes elided" figure.
+#[must_use]
 pub fn apply_delta(
     cache: &DeltaCache,
     key: &str,
@@ -115,6 +117,7 @@ pub fn apply_delta(
 /// when the caller already holds the serialized bytes. The serialized bytes MUST
 /// match `result` faithfully — if they differ, the identity hash will not reflect
 /// the actual result content.
+#[must_use]
 pub fn apply_delta_preserialized(
     cache: &DeltaCache,
     key: &str,
@@ -252,7 +255,7 @@ mod tests {
         let c = DeltaCache::new(8);
         let mut r1 = serde_json::json!({"content":[{"type":"text","text":"v1"}]});
         let n1 = content_text_len(&r1);
-        apply_delta(&c, "k", "t", &mut r1, n1);
+        let _ = apply_delta(&c, "k", "t", &mut r1, n1);
         let mut r2 = serde_json::json!({"content":[{"type":"text","text":"v2-different"}]});
         let n2 = content_text_len(&r2);
         assert!(apply_delta(&c, "k", "t", &mut r2, n2).is_none());

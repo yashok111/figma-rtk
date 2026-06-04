@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::config::Level;
 use crate::filter::FilterSet;
 
+#[must_use]
 #[derive(Default, Clone, Copy)]
 pub struct Savings {
     pub before: usize,
@@ -158,13 +159,13 @@ pub fn compress_payload(
 ) -> (String, Savings) {
     if let Ok(mut v) = serde_json::from_str::<Value>(s) {
         if v.pointer("/result/content").is_some() {
-            compress_result_with(v.get_mut("result").unwrap(), tool, level, filters);
+            let _ = compress_result_with(v.get_mut("result").unwrap(), tool, level, filters);
             let out = serde_json::to_string(&v).unwrap_or_else(|_| s.to_string());
             let sv = Savings::new(s.len(), out.len());
             return (out, sv);
         }
         if v.get("content").is_some() {
-            compress_result_with(&mut v, tool, level, filters);
+            let _ = compress_result_with(&mut v, tool, level, filters);
             let out = serde_json::to_string(&v).unwrap_or_else(|_| s.to_string());
             let sv = Savings::new(s.len(), out.len());
             return (out, sv);
@@ -763,7 +764,7 @@ mod tests {
 
         // Aggressive: attrs kept (only TOML filters + whitespace apply).
         let mut agg = mk();
-        compress_result_with(&mut agg, "get_design_context", Level::Aggressive, &fs);
+        let _ = compress_result_with(&mut agg, "get_design_context", Level::Aggressive, &fs);
         assert!(
             agg["content"][0]["text"].as_str().unwrap().contains("data-node-id"),
             "aggressive keeps node ids"
@@ -771,7 +772,7 @@ mod tests {
 
         // Standard: attrs kept.
         let mut std = mk();
-        compress_result_with(&mut std, "get_design_context", Level::Standard, &fs);
+        let _ = compress_result_with(&mut std, "get_design_context", Level::Standard, &fs);
         assert!(
             std["content"][0]["text"].as_str().unwrap().contains("data-name"),
             "standard keeps data-name"
@@ -897,7 +898,7 @@ mod tests {
 
         // Aggressive: node-tree untouched (geometry survives).
         let mut a = mk();
-        compress_result_with(&mut a, "get_design_context", Level::Aggressive, &fs);
+        let _ = compress_result_with(&mut a, "get_design_context", Level::Aggressive, &fs);
         assert!(
             a["content"][0]["text"].as_str().unwrap().contains("width=\"9\""),
             "aggressive keeps node-tree geometry"
@@ -905,7 +906,7 @@ mod tests {
 
         // Ultra but a different tool: untouched (strip is gated to get_design_context).
         let mut w = mk();
-        compress_result_with(&mut w, "get_metadata", Level::Ultra, &fs);
+        let _ = compress_result_with(&mut w, "get_metadata", Level::Ultra, &fs);
         assert!(
             w["content"][0]["text"].as_str().unwrap().contains("name=\"A\""),
             "node-tree strip is gated to get_design_context"
