@@ -555,6 +555,13 @@ mod tests {
         let xml = "<frame name=\"Hero\">\n    <text>Button Label</text>\n</frame>";
         let out = compress_text(xml);
         assert_eq!(out, "<frame name=\"Hero\"><text>Button Label</text></frame>");
+        // Whitespace-only invariant: removing ALL whitespace from input and output
+        // must give identical strings — the transform touched only whitespace chars.
+        assert_eq!(
+            ws_stripped(xml),
+            ws_stripped(&out),
+            "xml strip_indent must only remove whitespace, never other chars"
+        );
     }
 
     #[test]

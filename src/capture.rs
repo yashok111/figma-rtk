@@ -8,6 +8,50 @@ use std::path::{Path, PathBuf};
 
 use crate::fsutil::{create_private_new, safe_name};
 
+/// Test-only flag: when set, the write step inside `save_next` simulates a
+/// `write_all` failure so the cleanup branch (remove_file on write error) can
+/// be exercised without requiring a full filesystem or kernel tricks.
+/// Uses an atomic for lock-free reads, and a separate guard lock for serialization.
+#[cfg(test)]
+static FAIL_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn get_fail_write() -> bool {
+    FAIL_WRITE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// RAII guard: acquires a serialization lock when created, sets the FAIL_WRITE
+/// atomic to true, and resets it to false when dropped. This ensures tests that
+/// set the flag don't run concurrently, while allowing other tests to read the
+/// atomic without deadlock.
+#[cfg(test)]
+struct FailWriteGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl FailWriteGuard {
+    fn arm() -> Self {
+        let _lock = GUARD_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        FAIL_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        FailWriteGuard { _lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailWriteGuard {
+    fn drop(&mut self) {
+        FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Write a raw payload to the next free `dir/<tool>-NNNN.json` slot. The index is
 /// chosen by scanning existing files for that tool, so it survives a process
 /// restart without overwriting earlier fixtures (a plain per-process counter
@@ -24,7 +68,15 @@ pub fn save_next(dir: &Path, tool: &str, raw: &[u8]) -> std::io::Result<PathBuf>
         let path = dir.join(format!("{name}-{seq:04}.json"));
         match create_private_new(&path) {
             Ok(mut f) => {
-                if let Err(e) = f.write_all(raw) {
+                #[cfg(test)]
+                let write_result = if get_fail_write() {
+                    Err(std::io::Error::other("injected write failure"))
+                } else {
+                    f.write_all(raw)
+                };
+                #[cfg(not(test))]
+                let write_result = f.write_all(raw);
+                if let Err(e) = write_result {
                     // Don't leave a zero/partial fixture behind on a write error.
                     let _ = std::fs::remove_file(&path);
                     return Err(e);
@@ -77,8 +129,71 @@ mod tests {
         std::env::temp_dir().join(format!("frtk-capture-test-{}-{name}", std::process::id()))
     }
 
+    /// Covers the `Err(e) => return Err(e)` arm in `save_next` (open fails at
+    /// the OS level before any file is created). A read-only directory causes
+    /// `create_private_new` to return EACCES; the invariant is that no partial
+    /// fixture remains at the would-be path after `save_next` returns an error.
+    #[cfg(unix)]
+    #[test]
+    fn open_error_returns_err_no_partial_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp("open-err");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let expected_path = dir.join("get_metadata-0000.json");
+        let result = save_next(&dir, "get_metadata", b"partial data");
+
+        assert!(result.is_err(), "expected error on read-only dir, got {result:?}");
+        assert!(
+            !expected_path.exists(),
+            "partial file must not remain when open itself failed"
+        );
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Covers the `remove_file` cleanup branch (lines 27-30 in `save_next`):
+    /// `create_private_new` succeeds (the file IS created), then the write step
+    /// fails. The cleanup code must remove the zero/partial file so no stale
+    /// fixture remains. The write failure is injected via a test-only RAII guard
+    /// (`FailWriteGuard`) to avoid requiring a full filesystem or kernel privileges.
+    #[test]
+    fn write_error_cleans_up_partial_file() {
+        let dir = tmp("write-err");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let expected_path = dir.join("get_metadata-0000.json");
+
+        // Arm the fault injector: the next write_all inside save_next will fail.
+        // The guard automatically resets the flag when dropped, even on panic.
+        let _guard = FailWriteGuard::arm();
+        let result = save_next(&dir, "get_metadata", b"partial data");
+
+        // save_next must have returned an error (injected write failure).
+        assert!(result.is_err(), "expected injected write error, got {result:?}");
+
+        // The cleanup branch must have removed the partial fixture.
+        assert!(
+            !expected_path.exists(),
+            "remove_file cleanup branch must delete the partial fixture after write failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn writes_payload_to_named_file() {
+        // Acquire GUARD_LOCK before clearing FAIL_WRITE so this test cannot clear
+        // the flag while write_error_cleans_up_partial_file holds the lock and is
+        // relying on the flag being set.
+        let _g = GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+
         let dir = tmp("writes");
         let _ = std::fs::remove_dir_all(&dir);
         let path = save_next(&dir, "get_design_context", b"{\"x\":1}").unwrap();
@@ -89,6 +204,12 @@ mod tests {
 
     #[test]
     fn sanitizes_tool_name() {
+        // Acquire GUARD_LOCK before clearing FAIL_WRITE so this test cannot clear
+        // the flag while write_error_cleans_up_partial_file holds the lock and is
+        // relying on the flag being set.
+        let _g = GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+
         let dir = tmp("sani");
         let _ = std::fs::remove_dir_all(&dir);
         let path = save_next(&dir, "../evil/name", b"x").unwrap();
@@ -100,6 +221,12 @@ mod tests {
 
     #[test]
     fn save_next_advances_per_tool_and_never_overwrites() {
+        // Acquire GUARD_LOCK before clearing FAIL_WRITE so this test cannot clear
+        // the flag while write_error_cleans_up_partial_file holds the lock and is
+        // relying on the flag being set.
+        let _g = GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+
         let dir = tmp("next");
         let _ = std::fs::remove_dir_all(&dir);
         let p0 = save_next(&dir, "get_design_context", b"a").unwrap();
