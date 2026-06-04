@@ -54,9 +54,15 @@ impl DeltaCache {
     /// [`observe`] with the same content — mixing the two methods on the same key
     /// always produces the correct `Unchanged` / `Changed` outcome.
     pub fn observe_bytes(&self, key: &str, bytes: &[u8]) -> Outcome {
-        // SAFETY: serialized JSON is always valid UTF-8.
-        let s = std::str::from_utf8(bytes).unwrap_or_default();
-        self.observe(key, s)
+        // Serialized JSON is always valid UTF-8. If a caller ever violates that,
+        // fail SAFE: return `Changed` so the content is forwarded in full rather
+        // than collapsed to the sentinel. Mapping invalid bytes to "" (as the old
+        // `unwrap_or_default` did) would hash every non-UTF-8 payload to the same
+        // digest and wrongly elide differing content (silent data loss).
+        match std::str::from_utf8(bytes) {
+            Ok(s) => self.observe(key, s),
+            Err(_) => Outcome::Changed,
+        }
     }
 
     fn observe_digest(&self, key: &str, digest: u64) -> Outcome {
@@ -117,6 +123,13 @@ pub fn apply_delta(
 /// when the caller already holds the serialized bytes. The serialized bytes MUST
 /// match `result` faithfully — if they differ, the identity hash will not reflect
 /// the actual result content.
+///
+/// NB: the SSE/proxy hot path goes through [`apply_delta`] (not this directly).
+/// Its only other serialization is of the full JSON-RPC *envelope* (`{id, result,
+/// …}`), not the bare `result` subtree, so there is no result-only serialization
+/// to reuse — eliminating the hash serialization there would require fragile
+/// envelope splicing for no net win. This variant is for callers that already
+/// hold faithful `result` bytes.
 #[must_use]
 pub fn apply_delta_preserialized(
     cache: &DeltaCache,
@@ -209,6 +222,18 @@ mod tests {
         // Now flip back via observe_bytes — observe must see Changed.
         assert_eq!(c.observe_bytes("k", payload.as_bytes()), Outcome::Changed);
         assert_eq!(c.observe("k", payload), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn observe_bytes_invalid_utf8_fails_safe_changed() {
+        let c = DeltaCache::new(8);
+        // Establish a baseline for the key.
+        assert_eq!(c.observe("k", "real"), Outcome::First);
+        // Invalid UTF-8 must NOT be treated as a match (never wrongly elide) and
+        // must NOT poison the stored baseline.
+        let bad = [0xff_u8, 0xfe, 0xfd];
+        assert_eq!(c.observe_bytes("k", &bad), Outcome::Changed);
+        assert_eq!(c.observe("k", "real"), Outcome::Unchanged);
     }
 
     #[test]
