@@ -13,10 +13,15 @@ use serde_json::Value;
 use crate::config::Level;
 use crate::filter::FilterSet;
 
+#[must_use]
 #[derive(Default, Clone, Copy)]
 pub struct Savings {
     pub before: usize,
     pub after: usize,
+    /// True when `apply_structural` or `apply_text` mutated the value (e.g.
+    /// dropped `_meta` or a boilerplate block), even if `content[].text`
+    /// byte lengths happen to be unchanged (e.g. non-text content blocks only).
+    pub mutated: bool,
 }
 
 impl Savings {
@@ -24,10 +29,12 @@ impl Savings {
         Self {
             before,
             after: after.min(before),
+            mutated: false,
         }
     }
+    /// True when compression actually reduced content bytes.
     pub fn any(&self) -> bool {
-        self.before > 0
+        self.after < self.before
     }
 }
 
@@ -56,10 +63,13 @@ pub fn compress_result_with(
     // structure — this can drop whole `content[]` blocks (e.g. get_design_context
     // boilerplate, whose text is React code, not JSON) and keys like `_meta`. The
     // per-item pass below then compresses whatever text blocks survive.
-    if aggressive {
-        filters.apply_structural(tool, result);
-    }
+    let structural_mutated = if aggressive {
+        filters.apply_structural(tool, result)
+    } else {
+        false
+    };
 
+    let mut text_mutated = false;
     if let Some(content) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
         for item in content {
             if item.get("type").and_then(|t| t.as_str()) != Some("text") {
@@ -72,9 +82,16 @@ pub fn compress_result_with(
             // strips fields inside it; otherwise fall back to the whitespace pass.
             // At ultra, a non-JSON code block additionally has its Figma-reference
             // attributes (data-node-id / data-name) stripped — lossy, recoverable.
+            // Track whether this block's compressed value came from apply_text
+            // (a semantic filter), so we can set text_mutated only when the
+            // filtered result is actually written back (length guard below).
+            let mut from_filter = false;
             let compressed = if aggressive {
                 match filters.apply_text(tool, text) {
-                    Some(filtered) => filtered,
+                    Some(filtered) => {
+                        from_filter = true;
+                        filtered
+                    }
                     None => {
                         let c = compress_text(text);
                         // These transforms only make sense for get_design_context's
@@ -101,12 +118,28 @@ pub fn compress_result_with(
             };
             if compressed.len() < text.len() {
                 item["text"] = Value::String(compressed);
+                // apply_text ran a filter and the filtered result was actually
+                // written back. Only set text_mutated here, inside the length guard,
+                // so the flag reflects a real change to the forwarded bytes.
+                if from_filter {
+                    text_mutated = true;
+                }
             }
         }
     }
 
     let after = crate::cache::content_text_len(result);
-    Savings::new(before, after)
+    let mut sv = Savings::new(before, after);
+    // A structural filter may have mutated the envelope (dropped _meta, a whole
+    // content block, etc.) even when before==0 (no text content) or the text byte
+    // count did not decrease. A text filter (apply_text) similarly rewrites a
+    // content[].text field even if the output happens to be the same byte length.
+    // Track both separately so the caller can still emit a StatRec and forward
+    // the mutated bytes.
+    if structural_mutated || text_mutated {
+        sv.mutated = true;
+    }
+    sv
 }
 
 /// Whitespace-only convenience wrapper over [`compress_payload`].
@@ -126,13 +159,13 @@ pub fn compress_payload(
 ) -> (String, Savings) {
     if let Ok(mut v) = serde_json::from_str::<Value>(s) {
         if v.pointer("/result/content").is_some() {
-            compress_result_with(v.get_mut("result").unwrap(), tool, level, filters);
+            let _ = compress_result_with(v.get_mut("result").unwrap(), tool, level, filters);
             let out = serde_json::to_string(&v).unwrap_or_else(|_| s.to_string());
             let sv = Savings::new(s.len(), out.len());
             return (out, sv);
         }
         if v.get("content").is_some() {
-            compress_result_with(&mut v, tool, level, filters);
+            let _ = compress_result_with(&mut v, tool, level, filters);
             let out = serde_json::to_string(&v).unwrap_or_else(|_| s.to_string());
             let sv = Savings::new(s.len(), out.len());
             return (out, sv);
@@ -168,55 +201,92 @@ pub fn compress_text(s: &str) -> String {
 /// Drop whitespace runs that sit fully between `>` and `<` and contain a
 /// newline (i.e. pretty-printer indentation). Single intra-line spaces and any
 /// run holding real text content are left untouched.
+///
+/// UTF-8 safe: the delimiters (`>`, `<`, `\n`, `\r`, space, tab) are all
+/// single-byte ASCII codepoints and never appear as continuation bytes of a
+/// multibyte sequence, so per-byte matching cannot split a multibyte character.
+/// The only bytes we skip are confirmed whitespace ASCII bytes; the only bytes
+/// we copy are exact byte-index slices of the original `&str`, so multibyte
+/// content (e.g. Cyrillic, CJK) is always copied whole-codepoint.
 fn strip_xml_indent(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
+    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        out.push(c);
-        if c == '>' {
-            let mut j = i + 1;
-            let mut saw_newline = false;
-            while j < chars.len() && chars[j].is_whitespace() {
-                if chars[j] == '\n' || chars[j] == '\r' {
-                    saw_newline = true;
-                }
-                j += 1;
-            }
-            if saw_newline && j < chars.len() && chars[j] == '<' && j > i + 1 {
-                // Skip the whitespace run entirely.
-                i = j;
-                continue;
-            }
+    while i < bytes.len() {
+        // Copy up to and including the next `>` (or end of input).
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'>' {
+            i += 1;
         }
-        i += 1;
+        if i >= bytes.len() {
+            // No more `>` — copy the remainder and we're done.
+            out.push_str(&s[start..]);
+            break;
+        }
+        // Include the `>` itself.
+        i += 1; // now i points one past the `>`
+        out.push_str(&s[start..i]);
+
+        // Scan the whitespace run after `>`.
+        let ws_start = i;
+        let mut saw_newline = false;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            if bytes[i] == b'\n' || bytes[i] == b'\r' {
+                saw_newline = true;
+            }
+            i += 1;
+        }
+        // Drop the whitespace iff it contained a newline AND the run ends at `<`.
+        // If not, write it back verbatim.
+        if saw_newline && i < bytes.len() && bytes[i] == b'<' && i > ws_start {
+            // Skip — the whitespace run is pure indentation; continue from `<`.
+        } else {
+            out.push_str(&s[ws_start..i]);
+        }
     }
     out
 }
 
 fn collapse_code_ws(s: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
+    // Write directly into an output String, skipping leading blank lines until
+    // the first non-blank one. Blank runs of >1 are collapsed to a single blank.
+    // Trailing blank lines are omitted. No per-line heap allocation, no Vec, no
+    // O(n) remove(0) for the leading-blank strip.
+    let mut out = String::with_capacity(s.len());
     let mut blank_run = 0u32;
+    let mut started = false; // true once the first non-blank line has been written
+
     for raw in s.lines() {
         let line = raw.trim_end();
         if line.is_empty() {
-            blank_run += 1;
-            if blank_run <= 1 {
-                out.push(String::new());
+            if started {
+                blank_run += 1;
+                if blank_run == 1 {
+                    // Tentatively push a blank separator; it may be trailing and
+                    // will be trimmed below if no further content line follows.
+                    out.push('\n');
+                }
             }
+            // Before the first content line: skip (strip leading blanks).
         } else {
+            started = true;
             blank_run = 0;
-            out.push(line.to_string());
+            // If a blank separator was already pushed (blank_run==1 path above),
+            // the '\n' delimiter we push below comes immediately after it, giving
+            // the canonical "\n\n" (one blank line). If this is the very first
+            // content line, `out` is empty and we skip the leading newline.
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
         }
     }
-    while out.first().is_some_and(|l| l.is_empty()) {
-        out.remove(0);
-    }
-    while out.last().is_some_and(|l| l.is_empty()) {
+    // Strip any trailing blank lines: `out` ends with '\n' only when the last
+    // pushed item was a blank separator (blank_run >= 1 path). Trim those.
+    while out.ends_with('\n') {
         out.pop();
     }
-    out.join("\n")
+    out
 }
 
 /// Ultra-level only. Remove Figma reference attributes (`data-node-id`,
@@ -486,6 +556,29 @@ mod tests {
         let xml = "<frame name=\"Hero\">\n    <text>Button Label</text>\n</frame>";
         let out = compress_text(xml);
         assert_eq!(out, "<frame name=\"Hero\"><text>Button Label</text></frame>");
+        // Whitespace-only invariant: removing ALL whitespace from input and output
+        // must give identical strings — the transform touched only whitespace chars.
+        assert_eq!(
+            ws_stripped(xml),
+            ws_stripped(&out),
+            "xml strip_indent must only remove whitespace, never other chars"
+        );
+    }
+
+    #[test]
+    fn xml_strip_indent_multibyte_content_preserved() {
+        // Cyrillic characters are multibyte (2 bytes each in UTF-8). The byte scan
+        // must not split them, and content inside elements must be preserved verbatim.
+        let xml = "<root>\n    <item>Привет мир</item>\n    <item>Москва</item>\n</root>";
+        let out = compress_text(xml);
+        assert_eq!(
+            out,
+            "<root><item>Привет мир</item><item>Москва</item></root>",
+            "Cyrillic content must survive XML indent stripping intact"
+        );
+        // Each Cyrillic char should still be readable as valid UTF-8
+        assert!(out.is_ascii() || out.chars().all(|c| c != char::REPLACEMENT_CHARACTER),
+            "no replacement characters (no char splits)");
     }
 
     #[test]
@@ -493,6 +586,45 @@ mod tests {
         let code = "const a = 1;   \n\n\n\nconst b = 2;\n";
         let out = compress_text(code);
         assert_eq!(out, "const a = 1;\n\nconst b = 2;");
+    }
+
+    #[test]
+    fn code_collapse_all_blank() {
+        // An entirely-blank input (or all whitespace) should produce an empty string.
+        assert_eq!(collapse_code_ws(""), "");
+        assert_eq!(collapse_code_ws("   \n   \n   "), "");
+        assert_eq!(collapse_code_ws("\n\n\n"), "");
+    }
+
+    #[test]
+    fn code_collapse_leading_blanks_stripped() {
+        // Leading blank lines are stripped; content lines are preserved.
+        let code = "\n\n\nconst x = 1;";
+        let out = collapse_code_ws(code);
+        assert_eq!(out, "const x = 1;");
+    }
+
+    #[test]
+    fn code_collapse_trailing_blanks_stripped() {
+        // Trailing blank lines are stripped.
+        let code = "const x = 1;\n\n\n";
+        let out = collapse_code_ws(code);
+        assert_eq!(out, "const x = 1;");
+    }
+
+    #[test]
+    fn code_collapse_many_leading_blanks() {
+        // Many leading blanks (>1) are all removed; interior blank runs collapse to 1.
+        let code = "\n\n\n\n\nconst a = 1;\n\n\nconst b = 2;\n\n";
+        let out = collapse_code_ws(code);
+        assert_eq!(out, "const a = 1;\n\nconst b = 2;");
+    }
+
+    #[test]
+    fn code_collapse_single_line_trailing_spaces() {
+        // A single content line with trailing spaces: spaces stripped, no trailing newline.
+        assert_eq!(collapse_code_ws("hello   "), "hello");
+        assert_eq!(collapse_code_ws("  hello  "), "  hello"); // leading preserved, trailing stripped
     }
 
     #[test]
@@ -632,7 +764,7 @@ mod tests {
 
         // Aggressive: attrs kept (only TOML filters + whitespace apply).
         let mut agg = mk();
-        compress_result_with(&mut agg, "get_design_context", Level::Aggressive, &fs);
+        let _ = compress_result_with(&mut agg, "get_design_context", Level::Aggressive, &fs);
         assert!(
             agg["content"][0]["text"].as_str().unwrap().contains("data-node-id"),
             "aggressive keeps node ids"
@@ -640,7 +772,7 @@ mod tests {
 
         // Standard: attrs kept.
         let mut std = mk();
-        compress_result_with(&mut std, "get_design_context", Level::Standard, &fs);
+        let _ = compress_result_with(&mut std, "get_design_context", Level::Standard, &fs);
         assert!(
             std["content"][0]["text"].as_str().unwrap().contains("data-name"),
             "standard keeps data-name"
@@ -766,7 +898,7 @@ mod tests {
 
         // Aggressive: node-tree untouched (geometry survives).
         let mut a = mk();
-        compress_result_with(&mut a, "get_design_context", Level::Aggressive, &fs);
+        let _ = compress_result_with(&mut a, "get_design_context", Level::Aggressive, &fs);
         assert!(
             a["content"][0]["text"].as_str().unwrap().contains("width=\"9\""),
             "aggressive keeps node-tree geometry"
@@ -774,7 +906,7 @@ mod tests {
 
         // Ultra but a different tool: untouched (strip is gated to get_design_context).
         let mut w = mk();
-        compress_result_with(&mut w, "get_metadata", Level::Ultra, &fs);
+        let _ = compress_result_with(&mut w, "get_metadata", Level::Ultra, &fs);
         assert!(
             w["content"][0]["text"].as_str().unwrap().contains("name=\"A\""),
             "node-tree strip is gated to get_design_context"

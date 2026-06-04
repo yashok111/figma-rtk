@@ -203,11 +203,10 @@ fn run_verify(
 }
 
 fn run_init(file: Option<PathBuf>, port: u16, uninstall: bool) -> anyhow::Result<()> {
-    let file = match file.or_else(init::discover_mcp_file) {
-        Some(f) => f,
-        None => anyhow::bail!(
+    let Some(file) = file.or_else(init::discover_mcp_file) else {
+        anyhow::bail!(
             "could not find the figma plugin's .mcp.json; pass --file <path> explicitly"
-        ),
+        )
     };
     if uninstall {
         init::uninstall(&file)?;
@@ -237,14 +236,10 @@ fn run_compress(
         let p = filters_path.unwrap_or_else(|| PathBuf::from(".figma-rtk/filters.toml"));
         filter::FilterSet::load(&p)?
     };
-    let toolname = tool.clone().unwrap_or_default();
-    let (out, sv) = compress::compress_payload(&input, &toolname, level, &filters);
-    let saved = tokens::est(sv.before).saturating_sub(tokens::est(sv.after));
-    let pct = if sv.before > 0 {
-        100.0 * (sv.before.saturating_sub(sv.after)) as f64 / sv.before as f64
-    } else {
-        0.0
-    };
+    let toolname = tool.as_deref().unwrap_or_default();
+    let (out, sv) = compress::compress_payload(&input, toolname, level, &filters);
+    let saved = tokens::tok_saved(sv.before, sv.after);
+    let pct = tokens::pct_saved(sv.before, sv.after);
     eprintln!(
         "frtk compress[{}] level={level:?}  {} -> {} bytes  (~{saved} tokens, {pct:.1}%)",
         tool.as_deref().unwrap_or("stdin"),

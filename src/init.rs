@@ -6,8 +6,10 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, Context as _};
 use serde_json::Value;
+
+use crate::fsutil;
 
 const CANONICAL_URL: &str = "https://mcp.figma.com/mcp";
 
@@ -32,26 +34,9 @@ pub fn discover_mcp_file() -> Option<PathBuf> {
     versions.pop().map(|p| p.join(".mcp.json"))
 }
 
-/// Write `content` to `file` atomically: write a temp sibling, then rename it
-/// into place. Rename is atomic and replaces the destination name itself, so a
-/// crash never leaves a half-written config and a symlink at `file` is replaced
-/// rather than followed.
+/// Write `content` to `file` atomically via the shared fsutil helper.
 fn write_atomic(file: &Path, content: &str) -> anyhow::Result<()> {
-    let mut tmp = file.as_os_str().to_owned();
-    tmp.push(".frtk-tmp");
-    let tmp = PathBuf::from(tmp);
-    let _ = std::fs::remove_file(&tmp);
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("creating temp {}", tmp.display()))?;
-        f.write_all(content.as_bytes())?;
-    }
-    std::fs::rename(&tmp, file).with_context(|| format!("finalizing {}", file.display()))?;
-    Ok(())
+    fsutil::write_atomic(file, content.as_bytes())
 }
 
 fn backup_path(file: &Path) -> PathBuf {

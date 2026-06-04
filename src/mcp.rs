@@ -33,9 +33,10 @@ pub const TARGET_TOOLS: &[&str] = &[
 fn is_target(name: &str) -> bool {
     // Exact wire name, or MCP-namespaced (…__get_metadata). The `__` boundary
     // stops unrelated names like "evil_get_metadata" being treated as targets.
+    // Delegates to matches_tool which is zero-alloc (no heap allocation).
     TARGET_TOOLS
         .iter()
-        .any(|t| name == *t || name.ends_with(&format!("__{t}")))
+        .any(|t| crate::filter::matches_tool(name, t))
 }
 
 pub fn id_to_string(id: &Value) -> String {
@@ -148,7 +149,7 @@ fn transform_msg(
             });
         }
     }
-    if sv.any() {
+    if sv.mutated || sv.any() {
         Some(StatRec {
             tool: target.tool,
             before: sv.before,
@@ -158,6 +159,68 @@ fn transform_msg(
     } else {
         None
     }
+}
+
+/// Split an SSE body into event blocks, recognising `\r\n\r\n`, `\n\n`, and
+/// `\r\r` as block separators (RFC 7230 / text/event-stream). Each returned
+/// slice is a borrow of the original `body`; the separator bytes are NOT
+/// included. We deliberately do NOT globally replace `\r\n` → `\n` first,
+/// because non-target blocks must be forwarded verbatim (replacing line
+/// endings would mutate them).
+fn split_sse_blocks(body: &str) -> Vec<&str> {
+    let mut blocks: Vec<&str> = Vec::new();
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut start = 0;
+    let mut i = 0;
+    while i < len {
+        // \r\n\r\n  (4 bytes)
+        if i + 3 < len
+            && bytes[i] == b'\r'
+            && bytes[i + 1] == b'\n'
+            && bytes[i + 2] == b'\r'
+            && bytes[i + 3] == b'\n'
+        {
+            blocks.push(&body[start..i]);
+            i += 4;
+            start = i;
+        // \n\n  (2 bytes)
+        } else if i + 1 < len && bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+            blocks.push(&body[start..i]);
+            i += 2;
+            start = i;
+        // \r\r  (2 bytes)
+        } else if i + 1 < len && bytes[i] == b'\r' && bytes[i + 1] == b'\r' {
+            blocks.push(&body[start..i]);
+            i += 2;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    // Remainder after the last separator (may be empty).
+    if start <= len {
+        blocks.push(&body[start..]);
+    }
+    blocks
+}
+
+/// Detect the block separator style used in a body so we can reconstruct it
+/// faithfully when reassembling non-mutated blocks. Returns `"\r\n\r\n"`,
+/// `"\r\r"`, or `"\n\n"`.
+fn sse_separator(body: &str) -> &'static str {
+    let b = body.as_bytes();
+    for i in 0..b.len().saturating_sub(3) {
+        if b[i] == b'\r' && b[i + 1] == b'\n' && b[i + 2] == b'\r' && b[i + 3] == b'\n' {
+            return "\r\n\r\n";
+        }
+    }
+    for i in 0..b.len().saturating_sub(1) {
+        if b[i] == b'\r' && b[i + 1] == b'\r' {
+            return "\r\r";
+        }
+    }
+    "\n\n"
 }
 
 /// Transform an SSE (`text/event-stream`) body. Each event block is preserved;
@@ -171,8 +234,9 @@ pub fn transform_sse(
 ) -> (String, Vec<StatRec>) {
     let mut recs = Vec::new();
     let mut out_blocks: Vec<String> = Vec::new();
+    let sep = sse_separator(body);
 
-    for block in body.split("\n\n") {
+    for block in split_sse_blocks(body) {
         if block.trim().is_empty() {
             out_blocks.push(block.to_string());
             continue;
@@ -217,7 +281,7 @@ pub fn transform_sse(
         }
     }
 
-    (out_blocks.join("\n\n"), recs)
+    (out_blocks.join(sep), recs)
 }
 
 #[cfg(test)]
@@ -229,6 +293,20 @@ mod tests {
             tool: tool.to_string(),
             key: format!("{tool}|k"),
         }
+    }
+
+    #[test]
+    fn is_target_double_namespace_and_negative() {
+        // Double-namespaced wire name must be treated as a target.
+        assert!(
+            is_target("mcp__plugin_figma_figma__get_metadata"),
+            "double-namespace must be a target"
+        );
+        // A name sharing the suffix but lacking __ boundary must NOT be a target.
+        assert!(
+            !is_target("evil_get_metadata"),
+            "no __ boundary must NOT be a target"
+        );
     }
 
     #[test]
@@ -334,5 +412,118 @@ mod tests {
         let (second, _) = transform_sse(body, &ids, Level::Standard, &FilterSet::default(), Some(&cache));
         assert!(second.contains("Unchanged"), "identical re-read collapsed to sentinel");
         assert!(!second.contains("<a><b/></a>"));
+    }
+
+    // ----- CORR-1: CRLF SSE block splitting -----
+
+    #[test]
+    fn split_sse_blocks_recognizes_crlf_lf_and_cr() {
+        // \r\n\r\n  -- standard HTTP/1.1 SSE over TLS
+        let crlf = "A\r\nB\r\n\r\nC\r\nD";
+        let parts = split_sse_blocks(crlf);
+        assert_eq!(parts, vec!["A\r\nB", "C\r\nD"], "CRLF blocks");
+
+        // \n\n  -- bare LF (most test/debug scenarios)
+        let lf = "A\nB\n\nC\nD";
+        let parts = split_sse_blocks(lf);
+        assert_eq!(parts, vec!["A\nB", "C\nD"], "LF blocks");
+
+        // \r\r  -- bare CR (rarely used but spec-valid)
+        let cr = "A\rB\r\rC\rD";
+        let parts = split_sse_blocks(cr);
+        assert_eq!(parts, vec!["A\rB", "C\rD"], "CR blocks");
+
+        // Empty body
+        assert_eq!(split_sse_blocks(""), vec![""]);
+        // No separator: single block
+        assert_eq!(split_sse_blocks("no sep"), vec!["no sep"]);
+    }
+
+    #[test]
+    fn crlf_sse_body_gets_compressed_and_metered() {
+        // A CRLF-delimited SSE stream must be parsed, compressed, and emit a
+        // StatRec — previously the whole body was one block -> forwarded uncompressed.
+        let mut ids = HashMap::new();
+        ids.insert("5".to_string(), target("get_metadata"));
+        let pretty = "{\n  \"a\": 1,\n  \"b\": 2\n}";
+        // Build a CRLF SSE stream: event block + trailing CRLF-block separator
+        let data_json = serde_json::to_string(&serde_json::json!({
+            "id": 5,
+            "result": {
+                "content": [{"type": "text", "text": pretty}]
+            }
+        }))
+        .unwrap();
+        let body = format!("event: message\r\ndata: {data_json}\r\n\r\n");
+        let (out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
+        assert_eq!(recs.len(), 1, "must be metered — CRLF blocks now parsed");
+        // The output must be reassembled with CRLF separators (verbatim pass-through
+        // of non-target blocks and correct block rejoining).
+        assert!(out.contains("\r\n\r\n") || out.ends_with("\r\n"), "CRLF separator preserved");
+        // Minified JSON present (pretty-printed form gone). The inner text value is
+        // JSON-escaped inside the outer data: line, so check for the escaped form.
+        assert!(out.contains(r#"{\"a\":1,\"b\":2}"#), "content minified (escaped in wire)");
+    }
+
+    #[test]
+    fn sse_structural_mutation_drop_meta_image_block() {
+        // SSE path: apply_structural drops _meta + non-text (image) blocks are
+        // unchanged; the structural mutation must still cause a StatRec to be emitted
+        // (CORR-2: mutated flag) and _meta must be absent in the output (CORR-1 path).
+        let fs = FilterSet::parse(
+            "[[filter]]\nname=\"dc\"\ntools=[\"get_design_context\"]\ndrop_keys=[\"_meta\"]\n",
+        )
+        .unwrap();
+        let mut ids = HashMap::new();
+        ids.insert("7".to_string(), target("get_design_context"));
+        // Content: one image block only (no text) + _meta on the result envelope.
+        // before==0 (content_text_len counts only text blocks), so without the
+        // mutated flag, sv.any()==false and transform_msg returns None -> no StatRec.
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "id": 7,
+                "result": {
+                    "_meta": {"mcpRequestId": "abc"},
+                    "content": [{"type": "image", "url": "https://example.com/img.png"}]
+                }
+            }))
+            .unwrap()
+        );
+        let (out, recs) = transform_sse(&body, &ids, Level::Aggressive, &fs, None);
+        // _meta must have been dropped from the forwarded bytes.
+        assert!(!out.contains("mcpRequestId"), "_meta dropped by structural filter");
+        // A StatRec must be emitted (mutation flag gates it, not savings bytes).
+        assert_eq!(recs.len(), 1, "StatRec emitted for structural mutation with image-only content");
+    }
+
+    // ----- CORR-3: Savings::any() tightened; no spurious StatRec -----
+
+    #[test]
+    fn savings_any_false_for_identical_content() {
+        // any() must be false when content was not actually shrunk.
+        use crate::compress::Savings;
+        let s = Savings::new(100, 100); // before == after
+        assert!(!s.any(), "any() must be false when content did not shrink");
+        let s2 = Savings::new(0, 0); // both zero
+        assert!(!s2.any(), "any() false for empty content");
+        let s3 = Savings::new(100, 50); // shrank
+        assert!(s3.any(), "any() true when after < before");
+    }
+
+    #[test]
+    fn no_stat_rec_for_already_compact_json() {
+        // Already-minified content: compress_result_with must not emit a StatRec
+        // (no savings, no mutation) — the proxy invariant comment in proxy.rs.
+        let mut ids = HashMap::new();
+        ids.insert("1".to_string(), target("get_metadata"));
+        // JSON already compact — no whitespace to remove, no filter applied.
+        let compact = r#"{"a":1,"b":2}"#;
+        let body = format!(
+            "event: message\ndata: {{\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}}}\n\n",
+            serde_json::to_string(compact).unwrap()
+        );
+        let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
+        assert!(recs.is_empty(), "no StatRec for already-compact content (got {:?})", recs);
     }
 }

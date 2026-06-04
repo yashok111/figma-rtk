@@ -8,6 +8,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil;
+
 fn store_path() -> PathBuf {
     if let Ok(p) = std::env::var("FRTK_TRUST") {
         return PathBuf::from(p);
@@ -36,8 +38,7 @@ fn save(store: &Path, set: &BTreeSet<String>) -> anyhow::Result<()> {
     if let Some(parent) = store.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(store, serde_json::to_string_pretty(set)?)?;
-    Ok(())
+    fsutil::write_atomic(store, serde_json::to_string_pretty(set)?.as_bytes())
 }
 
 fn contains_in(store: &Path, dir: &Path) -> bool {
@@ -99,6 +100,33 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         add_in(&store, &std::env::temp_dir()).unwrap();
         assert!(!contains_in(&store, Path::new("/definitely/not/added")));
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn corrupt_store_returns_empty_no_panic() {
+        // load() must return an empty set (and not panic) when the store contains
+        // invalid JSON (simulates a crash-corrupted file).
+        let store = tmp_store("corrupt");
+        std::fs::write(&store, b"not valid json {{{ ]]]").unwrap();
+        let set = load(&store);
+        assert!(set.is_empty(), "corrupt store must yield empty set");
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_behind() {
+        // A successful save must not leave a .frtk-tmp sibling.
+        let store = tmp_store("notmp");
+        let _ = std::fs::remove_file(&store);
+        add_in(&store, &std::env::temp_dir()).unwrap();
+        // The store itself exists.
+        assert!(store.exists(), "store must exist after save");
+        // No .frtk-tmp sibling must remain.
+        let mut tmp_path = store.as_os_str().to_owned();
+        tmp_path.push(".frtk-tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_path);
+        assert!(!tmp_path.exists(), ".frtk-tmp must not be left behind");
         let _ = std::fs::remove_file(&store);
     }
 }
