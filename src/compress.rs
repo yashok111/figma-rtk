@@ -13,6 +13,83 @@ use serde_json::Value;
 use crate::config::Level;
 use crate::filter::FilterSet;
 
+// ---------------------------------------------------------------------------
+// Ultra text-transform registry
+// ---------------------------------------------------------------------------
+
+/// A named, tool-gated Ultra text transform applied when no TOML filter matched
+/// a content block. Pure-functional; lossy but tee-recoverable. Registered in
+/// ULTRA_TRANSFORMS; the content loop is agnostic to which tools exist.
+trait TextTransformer: Sync {
+    fn applies(&self, tool: &str, text: &str) -> bool;
+    fn transform(&self, text: &str) -> String;
+    /// Human-readable identifier, used for logging and diagnostics.
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str;
+}
+
+/// Ultra transform for `get_design_context`: strips Figma-ref node attributes
+/// from generated JSX, or reduces a sparse node-tree to id+tag only.
+/// The `applies` check is text-agnostic (tool-match only); the two sub-cases
+/// (node-tree vs JSX) are resolved inside `transform`, exactly mirroring the
+/// original if/else nesting.
+struct DesignContextJsx;
+
+impl TextTransformer for DesignContextJsx {
+    fn applies(&self, tool: &str, _text: &str) -> bool {
+        crate::filter::matches_tool(tool, "get_design_context")
+    }
+
+    fn transform(&self, text: &str) -> String {
+        if is_figma_node_tree(text) {
+            strip_node_tree_attrs(text)
+        } else {
+            compress_jsx_code(&strip_figma_node_attrs(text))
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "DesignContextJsx"
+    }
+}
+
+/// Ultra transform for `get_metadata`: strips positional geometry attributes
+/// (x, y, width, height) from metadata XML. The `applies` check includes the
+/// `starts_with('<')` guard that was in the original else-if branch.
+struct MetadataPosAttrs;
+
+impl TextTransformer for MetadataPosAttrs {
+    fn applies(&self, tool: &str, text: &str) -> bool {
+        crate::filter::matches_tool(tool, "get_metadata") && text.starts_with('<')
+    }
+
+    fn transform(&self, text: &str) -> String {
+        strip_metadata_pos_attrs(text)
+    }
+
+    fn name(&self) -> &'static str {
+        "MetadataPosAttrs"
+    }
+}
+
+/// Registry of Ultra text transforms. Order is significant: first match wins.
+/// `get_design_context` is listed before `get_metadata` to preserve the
+/// first-match order of the original if/else chain.
+static ULTRA_TRANSFORMS: &[&dyn TextTransformer] = &[&DesignContextJsx, &MetadataPosAttrs];
+
+/// Walk the registry and return the first matching transform's output, or
+/// return `text` unchanged when no transform applies. Called at Ultra level
+/// only; the `ultra` gate lives at the call site so Standard/Aggressive paths
+/// remain byte-identical.
+fn apply_ultra_transform(tool: &str, text: String) -> String {
+    for t in ULTRA_TRANSFORMS {
+        if t.applies(tool, &text) {
+            return t.transform(&text);
+        }
+    }
+    text
+}
+
 #[must_use]
 #[derive(Default, Clone, Copy)]
 pub struct Savings {
@@ -151,27 +228,10 @@ pub fn compress_result_with_min_priority(
                     }
                     None => {
                         let c = compress_text(text);
-                        // These transforms only make sense for get_design_context's
-                        // generated JSX; gate them to that tool so a use_figma return
-                        // that happens to be a raw HTML/JSX string is never touched.
-                        // Strip Figma-ref attrs, then dedent the JSX (both lossy only
-                        // re: Code Connect traceability / formatting — rendering is
-                        // preserved; raw stays recoverable via tee/capture).
-                        if ultra && crate::filter::matches_tool(tool, "get_design_context") {
-                            if is_figma_node_tree(&c) {
-                                // Sparse node-tree dump (a section/frame's metadata,
-                                // not React): reduce each element to `<tag id="…">`.
-                                strip_node_tree_attrs(&c)
-                            } else {
-                                compress_jsx_code(&strip_figma_node_attrs(&c))
-                            }
-                        } else if ultra
-                            && crate::filter::matches_tool(tool, "get_metadata")
-                            && c.starts_with('<')
-                        {
-                            // get_metadata XML: strip positional attrs x/y/width/height.
-                            // Lossy (geometry gone), ultra-gated, tee keeps raw recoverable.
-                            strip_metadata_pos_attrs(&c)
+                        // Ultra: dispatch through the ULTRA_TRANSFORMS registry.
+                        // Standard/Aggressive return plain `c` (whitespace-only pass).
+                        if ultra {
+                            apply_ultra_transform(tool, c)
                         } else {
                             c
                         }
@@ -1409,6 +1469,40 @@ mod tests {
         // The important thing is the get_metadata branch did NOT run.
         // (strip_node_tree_attrs drops geometry too, but via a different code path.)
         let _ = t_gdc; // outcome asserted separately in other tests
+    }
+
+    // -----------------------------------------------------------------------
+    // ULTRA_TRANSFORMS registry dispatch parity test
+    // -----------------------------------------------------------------------
+
+    /// Verify that `apply_ultra_transform` produces the same output as the
+    /// original inline if/else chain for:
+    ///   (a) a get_design_context JSX sample,
+    ///   (b) a get_metadata XML sample starting with '<',
+    ///   (c) an unknown tool (passthrough).
+    /// This test does NOT change or re-state any existing assertion; it only
+    /// confirms the new dispatch path is observably equivalent.
+    #[test]
+    fn ultra_transforms_dispatch_matches_original_behaviour() {
+        // (a) get_design_context JSX: strip_figma_node_attrs + compress_jsx_code
+        let jsx = r#"<div className="x" data-node-id="1:2" data-name="H">hi</div>"#;
+        let c = compress_text(jsx);
+        let expected_gdc = compress_jsx_code(&strip_figma_node_attrs(&c));
+        let got_gdc = apply_ultra_transform("mcp__plugin__get_design_context", c.clone());
+        assert_eq!(got_gdc, expected_gdc, "gdc JSX dispatch mismatch");
+
+        // (b) get_metadata XML starting with '<': strip_metadata_pos_attrs
+        let xml = r#"<frame id="1:1" name="P" x="0" y="0" width="100" height="50" />"#;
+        let c2 = compress_text(xml);
+        let expected_meta = strip_metadata_pos_attrs(&c2);
+        let got_meta = apply_ultra_transform("mcp__plugin__get_metadata", c2.clone());
+        assert_eq!(got_meta, expected_meta, "metadata XML dispatch mismatch");
+
+        // (c) Unknown tool: passthrough (text unchanged)
+        let plain = "hello world";
+        let c3 = compress_text(plain);
+        let got_unknown = apply_ultra_transform("mcp__plugin__some_other_tool", c3.clone());
+        assert_eq!(got_unknown, c3, "unknown tool must pass through unchanged");
     }
 
     /// Measure: a representative 10-node fixture at Ultra must achieve ≥35% reduction
