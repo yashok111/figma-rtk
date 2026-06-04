@@ -1,0 +1,7 @@
+# Committed deps (icu_* 2.2.0, idna_adapter 1.2.2 in Cargo.lock) require rustc
+# >= 1.86; a default 1.85.1 cannot build the project. Pinning here makes rustup
+# auto-select a known-good toolchain for every cargo invocation in this directory
+# (the hook, local builds, CI, a fresh clone) — no `cargo +<ver>` prefix needed.
+# Bump as deps' MSRV moves; switch to "stable" if you prefer auto-tracking.
+[toolchain]
+channel = "1.95.0"
