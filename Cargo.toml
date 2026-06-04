@@ -29,4 +29,7 @@ dirs = "5"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
-opt-level = 2
+# Standard release hygiene for a shipped binary (no measured perf claim — frtk is
+# I/O-bound, so these mainly affect CPU/binary-size, not upstream-dominated latency).
+opt-level = 3
+lto = "thin"
