@@ -1,7 +1,7 @@
 //! End-to-end test of the proxy pipeline against a mock upstream — the part we
 //! cannot exercise against the live Figma server without OAuth. Proves that a
 //! tools/call response for a target tool is compressed, captured, and metered
-//! as it flows Claude-Code -> frtk -> upstream and back.
+//! as it flows agent -> frtk -> upstream and back.
 //!
 //! ENV_LOCK (a std Mutex) is intentionally held across awaits to serialize the
 //! tests that mutate the process-global FRTK_LEDGER; that lint is irrelevant here.
@@ -23,7 +23,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Used to handle the now-async (spawn_blocking) write side-effects: the proxy
 /// returns the response before the fs write completes, so assertions that read
 /// ledger/tee/capture files need to wait a short time for the write to land.
-async fn poll_until(check: impl Fn() -> bool) {
+async fn poll_until(label: &str, check: impl Fn() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
         if check() {
@@ -31,6 +31,17 @@ async fn poll_until(check: impl Fn() -> bool) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    panic!("timed out waiting for {label}");
+}
+
+async fn wait_for_ledger_lines(ledger: &std::path::Path, min_lines: usize) {
+    let ledger = ledger.to_path_buf();
+    poll_until("ledger lines", move || {
+        std::fs::read_to_string(&ledger)
+            .map(|s| s.lines().count() >= min_lines)
+            .unwrap_or(false)
+    })
+    .await;
 }
 
 /// Minified form of the inner payload below (serde sorts object keys).
@@ -85,11 +96,57 @@ async fn spawn_mock(body: String, ctype: &'static str) -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_auth_capture_mock(
+    body: String,
+    ctype: &'static str,
+    seen_auth: Arc<Mutex<Option<String>>>,
+) -> String {
+    let router = Router::new().route(
+        "/mcp",
+        post(move |headers: HeaderMap| {
+            let body = body.clone();
+            let seen_auth = seen_auth.clone();
+            async move {
+                let auth = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                *seen_auth.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+                axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, ctype)
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
 async fn post_through_proxy(state: proxy::AppState) -> Vec<u8> {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/mcp")
         .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(rpc_request()))
+        .unwrap();
+    let resp = proxy::app(state).oneshot(req).await.unwrap();
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+async fn post_through_proxy_with_auth(state: proxy::AppState, auth: &str) -> Vec<u8> {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, auth)
         .body(Body::from(rpc_request()))
         .unwrap();
     let resp = proxy::app(state).oneshot(req).await.unwrap();
@@ -121,7 +178,7 @@ async fn pipeline_compresses_captures_and_meters() {
 
     // capture wrote a fixture of the raw (pre-compression) body — poll until
     // the spawn_blocking write completes (proxy returns response before fs write).
-    poll_until(|| {
+    poll_until("captured fixture", || {
         std::fs::read_dir(&capture)
             .map(|d| d.filter_map(|e| e.ok()).count() >= 1)
             .unwrap_or(false)
@@ -133,7 +190,10 @@ async fn pipeline_compresses_captures_and_meters() {
         .collect();
     assert_eq!(fixtures.len(), 1, "one fixture captured");
     let raw = std::fs::read_to_string(fixtures[0].path()).unwrap();
-    assert!(raw.contains("\\n"), "captured fixture is the raw pretty payload");
+    assert!(
+        raw.contains("\\n"),
+        "captured fixture is the raw pretty payload"
+    );
 
     // --- text/event-stream (SSE) response ---------------------------------
     let sse = format!("event: message\ndata: {}\n\n", rpc_response_envelope());
@@ -155,7 +215,7 @@ async fn pipeline_compresses_captures_and_meters() {
 
     // --- ledger recorded both calls ---------------------------------------
     // Poll until both ledger lines are flushed by the spawn_blocking tasks.
-    poll_until(|| {
+    poll_until("two ledger lines", || {
         std::fs::read_to_string(&ledger)
             .map(|s| s.lines().count() >= 2)
             .unwrap_or(false)
@@ -172,21 +232,86 @@ async fn pipeline_compresses_captures_and_meters() {
     // (always non-empty once stamped); upstream_ms is NOT asserted > 0 because a
     // sub-millisecond in-process round-trip truncates to 0 via as_millis() and
     // would flake.
-    let first_rec: StatRec = serde_json::from_str(lines[0])
-        .expect("first ledger line must deserialise as StatRec");
+    let first_rec: StatRec =
+        serde_json::from_str(lines[0]).expect("first ledger line must deserialise as StatRec");
     assert!(
         !first_rec.level.is_empty(),
         "level must be non-empty in the ledger record (stamping loop ran)"
     );
 
-    let second_rec: StatRec = serde_json::from_str(lines[1])
-        .expect("second ledger line must deserialise as StatRec");
+    let second_rec: StatRec =
+        serde_json::from_str(lines[1]).expect("second ledger line must deserialise as StatRec");
     assert!(
         !second_rec.level.is_empty(),
         "level must be non-empty in the second ledger record (stamping loop ran)"
     );
 
     std::env::remove_var("FRTK_LEDGER");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn authorization_header_is_forwarded_but_not_written_to_artifacts() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("frtk-auth-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let capture = base.join("fixtures");
+    let tee_dir = base.join("tee");
+    let seen_auth = Arc::new(Mutex::new(None));
+    let sentinel = "Bearer frtk-secret-token-must-not-hit-disk";
+
+    let upstream = spawn_auth_capture_mock(
+        rpc_response_envelope(),
+        "application/json",
+        seen_auth.clone(),
+    )
+    .await;
+    let state = proxy::build_state_with(
+        &upstream,
+        Some(capture.clone()),
+        figma_rtk::config::TeeMode::Always,
+        Some(tee_dir.clone()),
+        figma_rtk::config::Level::Standard,
+        figma_rtk::filter::FilterSet::default(),
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let _ = post_through_proxy_with_auth(state, sentinel).await;
+
+    assert_eq!(
+        seen_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref(),
+        Some(sentinel),
+        "proxy must relay the bearer token upstream"
+    );
+    poll_until("auth safety capture and tee files", || {
+        capture.exists()
+            && tee_dir.exists()
+            && std::fs::read_dir(&capture)
+                .map(|d| d.filter_map(|e| e.ok()).count() >= 1)
+                .unwrap_or(false)
+            && std::fs::read_dir(&tee_dir)
+                .map(|d| d.filter_map(|e| e.ok()).count() >= 1)
+                .unwrap_or(false)
+    })
+    .await;
+
+    for dir in [&capture, &tee_dir] {
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let content = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                !content.contains(sentinel),
+                "{} must not contain the bearer token",
+                entry.path().display()
+            );
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -228,13 +353,14 @@ async fn spawn_oauth_mock() -> String {
     format!("http://{addr}")
 }
 
-/// The proxy must present ITSELF as the OAuth protected resource so Claude
-/// Code's SDK (which dialed the proxy, not Figma) accepts the discovery
+/// The proxy must present ITSELF as the OAuth protected resource so the agent SDK
+/// (which dialed the proxy, not Figma) accepts the discovery
 /// documents. `resource` and the `resource_metadata` pointer are rewritten to
 /// the proxy origin; `authorization_servers` / `authorization_uri` / `scope`
 /// stay pointed at the real Figma auth server.
 #[tokio::test]
 async fn oauth_discovery_rewritten_to_proxy_origin() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let upstream = spawn_oauth_mock().await;
     let state = proxy::build_state(&upstream, None).unwrap();
 
@@ -250,7 +376,10 @@ async fn oauth_discovery_rewritten_to_proxy_origin() {
         .await
         .unwrap();
     let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["resource"], "http://127.0.0.1:7337/mcp", "resource rewritten");
+    assert_eq!(
+        v["resource"], "http://127.0.0.1:7337/mcp",
+        "resource rewritten"
+    );
     assert_eq!(
         v["authorization_servers"][0], "https://api.figma.com",
         "auth server preserved"
@@ -279,7 +408,10 @@ async fn oauth_discovery_rewritten_to_proxy_origin() {
         ),
         "resource_metadata repointed at proxy: {wa}"
     );
-    assert!(wa.contains(r#"scope="mcp:connect""#), "scope preserved: {wa}");
+    assert!(
+        wa.contains(r#"scope="mcp:connect""#),
+        "scope preserved: {wa}"
+    );
     assert!(
         wa.contains(
             r#"authorization_uri="https://api.figma.com/.well-known/oauth-authorization-server""#
@@ -360,6 +492,7 @@ async fn spawn_lying_content_length(_declared_size: usize, actual_size: usize) -
 /// A response body exceeding MAX_RESP_BODY must produce 502, not OOM.
 #[tokio::test]
 async fn oversized_response_body_returns_502() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Use one byte more than MAX_RESP_BODY.
     let over_limit = proxy::MAX_RESP_BODY + 1;
     let upstream = spawn_mock_sized(over_limit, "application/json").await;
@@ -385,6 +518,7 @@ async fn oversized_response_body_returns_502() {
 /// hint is present and the actual body exceeds the cap.
 #[tokio::test]
 async fn lying_content_length_returns_502() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Send MAX_RESP_BODY + 1 bytes with no Content-Length header.
     // collect_capped must hit the cap and return an error -> 502.
     let over_limit = proxy::MAX_RESP_BODY + 1;
@@ -414,6 +548,7 @@ async fn lying_content_length_returns_502() {
 /// Content-Length) is covered at the unit level in `collect_capped`.
 #[tokio::test]
 async fn lying_content_length_small_body_forwarded() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Send 100 bytes with no Content-Length header; server closes connection.
     // `collect_capped` must forward the body without 502ing.
     let actual_small: usize = 100;
@@ -445,6 +580,7 @@ async fn lying_content_length_small_body_forwarded() {
 /// fires and the classified error is 504.
 #[tokio::test]
 async fn hung_upstream_returns_504() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Bind a port and keep the listener alive (accepting the TCP connection)
     // but never respond. We do this by spawning a task that accepts and then
     // sleeps forever.
@@ -493,6 +629,7 @@ async fn hung_upstream_returns_504() {
 /// or a generic error. This tests the `is_connect()` branch of classify_error.
 #[tokio::test]
 async fn connect_refused_returns_502() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Bind a port, then immediately drop the listener so the port is closed.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -537,6 +674,7 @@ async fn connect_refused_returns_502() {
 /// verbatim — the body the proxy returns must equal the body the mock sent.
 #[tokio::test]
 async fn non_target_passthrough_body_unchanged() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // A tools/call for a non-target tool (e.g. use_figma — not in TARGET_TOOLS).
     let non_target_body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -581,7 +719,8 @@ async fn delta_cache_collapses_identical_reread() {
     let base = std::env::temp_dir().join(format!("frtk-delta-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    std::env::set_var("FRTK_LEDGER", base.join("ledger.jsonl"));
+    let ledger = base.join("ledger.jsonl");
+    std::env::set_var("FRTK_LEDGER", &ledger);
 
     let upstream = spawn_mock(rpc_response_envelope(), "application/json").await;
     let state = proxy::build_state_with(
@@ -599,14 +738,21 @@ async fn delta_cache_collapses_identical_reread() {
 
     // First read: full (compressed) content.
     let v1: Value = serde_json::from_slice(&post_clone(&app).await).unwrap();
-    assert_eq!(v1["result"]["content"][0]["text"].as_str().unwrap(), EXPECT_MIN);
+    assert_eq!(
+        v1["result"]["content"][0]["text"].as_str().unwrap(),
+        EXPECT_MIN
+    );
 
     // Identical re-read: collapsed to the delta sentinel.
     let v2: Value = serde_json::from_slice(&post_clone(&app).await).unwrap();
     let t2 = v2["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(t2.contains("Unchanged"), "second identical read collapsed: {t2}");
+    assert!(
+        t2.contains("Unchanged"),
+        "second identical read collapsed: {t2}"
+    );
     assert!(!t2.contains(EXPECT_MIN));
 
+    wait_for_ledger_lines(&ledger, 2).await;
     std::env::remove_var("FRTK_LEDGER");
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -733,6 +879,7 @@ async fn spawn_get_mock(body: String, ctype: &'static str) -> String {
 /// forwarded byte-for-byte — the proxy must NOT buffer or transform it.
 #[tokio::test]
 async fn get_mcp_stream_passes_through_verbatim() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sse_body = "event: ping\ndata: {\"type\":\"ping\"}\n\nevent: message\ndata: {\"id\":1}\n\n";
     let upstream = spawn_get_mock(sse_body.to_string(), "text/event-stream").await;
     let state = proxy::build_state(&upstream, None).unwrap();
@@ -766,7 +913,8 @@ async fn aggressive_level_applies_filters_through_proxy() {
     let base = std::env::temp_dir().join(format!("frtk-agg-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    std::env::set_var("FRTK_LEDGER", base.join("ledger.jsonl"));
+    let ledger = base.join("ledger.jsonl");
+    std::env::set_var("FRTK_LEDGER", &ledger);
 
     // Build a response with a code block + a boilerplate block matching drop_where.
     let upstream_body = serde_json::json!({
@@ -813,6 +961,7 @@ async fn aggressive_level_applies_filters_through_proxy() {
         "code block must survive: {out}"
     );
 
+    wait_for_ledger_lines(&ledger, 1).await;
     std::env::remove_var("FRTK_LEDGER");
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -847,7 +996,7 @@ async fn tee_writes_raw_body_to_dir() {
     let _ = post_through_proxy(state).await;
 
     // Poll until the spawn_blocking tee write completes.
-    poll_until(|| {
+    poll_until("tee raw body", || {
         std::fs::read_dir(&tee_dir)
             .map(|d| d.filter_map(|e| e.ok()).count() >= 1)
             .unwrap_or(false)
@@ -863,7 +1012,11 @@ async fn tee_writes_raw_body_to_dir() {
 
     // The file must be byte-identical to the raw upstream body (pre-compression).
     let raw = std::fs::read_to_string(entries[0].path()).unwrap();
-    assert_eq!(raw, rpc_response_envelope(), "tee file must be byte-identical to the raw upstream body");
+    assert_eq!(
+        raw,
+        rpc_response_envelope(),
+        "tee file must be byte-identical to the raw upstream body"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -914,12 +1067,15 @@ async fn tee_labels_raw_under_every_target_tool_in_a_batch() {
     let _ = proxy::app(state).oneshot(req).await.unwrap();
 
     // Poll until both spawn_blocking tee writes land.
-    poll_until(|| {
+    poll_until("batch tee raw bodies", || {
         tee_dir.join("get_metadata.raw").exists() && tee_dir.join("get_screenshot.raw").exists()
     })
     .await;
 
-    assert!(tee_dir.join("get_metadata.raw").exists(), "get_metadata.raw must exist");
+    assert!(
+        tee_dir.join("get_metadata.raw").exists(),
+        "get_metadata.raw must exist"
+    );
     assert!(
         tee_dir.join("get_screenshot.raw").exists(),
         "get_screenshot.raw must exist — a batch must not hide one tool's raw under another's filename"
@@ -1004,10 +1160,7 @@ async fn batch_request_compresses_target_and_passes_nontarget() {
     let target_text = target_resp["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert_eq!(
-        target_text, EXPECT_MIN,
-        "target result must be minified"
-    );
+    assert_eq!(target_text, EXPECT_MIN, "target result must be minified");
 
     // Non-target: content text must be unchanged.
     let nt_text = nontarget_resp["result"]["content"][0]["text"]
@@ -1021,7 +1174,7 @@ async fn batch_request_compresses_target_and_passes_nontarget() {
     // Exactly 1 ledger line (only the target tool was compressed).
     // Poll until the spawn_blocking ledger write completes.
     let ledger_clone = ledger.clone();
-    poll_until(move || {
+    poll_until("batch ledger line", move || {
         std::fs::read_to_string(&ledger_clone)
             .map(|s| s.lines().count() >= 1)
             .unwrap_or(false)
@@ -1052,6 +1205,7 @@ async fn batch_request_compresses_target_and_passes_nontarget() {
 /// cap tested in `oversized_response_body_returns_502`.
 #[tokio::test]
 async fn oversized_request_body_returns_413() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Any upstream will do — the proxy must reject the request before sending it.
     let upstream = spawn_mock("{}".to_string(), "application/json").await;
     let state = proxy::build_state(&upstream, None).unwrap();
@@ -1105,7 +1259,10 @@ async fn already_compact_content_produces_no_ledger_entry() {
     let body = post_through_proxy(state).await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let text = v["result"]["content"][0]["text"].as_str().unwrap();
-    assert_eq!(text, compact_text, "already-compact content must pass through unchanged");
+    assert_eq!(
+        text, compact_text,
+        "already-compact content must pass through unchanged"
+    );
 
     // No ledger entry must have been written.
     let ledger_content = std::fs::read_to_string(&ledger).unwrap_or_default();
@@ -1130,9 +1287,7 @@ async fn already_compact_content_produces_no_ledger_entry() {
 ///
 /// The captured headers are written into `captured_req_headers`; the test
 /// asserts that the `Mcp-Session-Id` the client sent was relayed.
-async fn spawn_session_mock(
-    captured_req_headers: Arc<Mutex<Vec<HeaderMap>>>,
-) -> String {
+async fn spawn_session_mock(captured_req_headers: Arc<Mutex<Vec<HeaderMap>>>) -> String {
     let captured_post = captured_req_headers.clone();
     let captured_delete = captured_req_headers.clone();
 
@@ -1142,7 +1297,8 @@ async fn spawn_session_mock(
             post(move |req: axum::extract::Request| {
                 let cap = captured_post.clone();
                 async move {
-                    cap.lock().unwrap_or_else(|e| e.into_inner())
+                    cap.lock()
+                        .unwrap_or_else(|e| e.into_inner())
                         .push(req.headers().clone());
                     axum::response::Response::builder()
                         .header(header::CONTENT_TYPE, "application/json")
@@ -1157,7 +1313,8 @@ async fn spawn_session_mock(
             delete(move |req: axum::extract::Request| {
                 let cap = captured_delete.clone();
                 async move {
-                    cap.lock().unwrap_or_else(|e| e.into_inner())
+                    cap.lock()
+                        .unwrap_or_else(|e| e.into_inner())
                         .push(req.headers().clone());
                     axum::response::Response::builder()
                         .status(StatusCode::OK)
@@ -1184,6 +1341,7 @@ async fn spawn_session_mock(
 /// REQ_HOP_BY_HOP nor RESP_HOP_BY_HOP); it is a regression guard, not a fix.
 #[tokio::test]
 async fn session_lifecycle_relays_session_id_and_delete() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let captured_req_headers: Arc<Mutex<Vec<HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_session_mock(captured_req_headers.clone()).await;
     let state = proxy::build_state(&upstream, None).unwrap();
@@ -1215,7 +1373,9 @@ async fn session_lifecycle_relays_session_id_and_delete() {
 
     // Check that Mcp-Session-Id was relayed on the request leg (to the upstream).
     {
-        let hdrs = captured_req_headers.lock().unwrap_or_else(|e| e.into_inner());
+        let hdrs = captured_req_headers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert!(
             !hdrs.is_empty(),
             "mock must have captured the POST request headers"
@@ -1247,8 +1407,14 @@ async fn session_lifecycle_relays_session_id_and_delete() {
 
     // Check that the DELETE also relayed Mcp-Session-Id to the upstream.
     {
-        let hdrs = captured_req_headers.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(hdrs.len(), 2, "both POST and DELETE must have been captured");
+        let hdrs = captured_req_headers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            hdrs.len(),
+            2,
+            "both POST and DELETE must have been captured"
+        );
         let delete_session = hdrs[1]
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())

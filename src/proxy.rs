@@ -3,13 +3,13 @@
 //! results of the heavy read tools, compresses them on the way back.
 
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::response::Builder as ResponseBuilder;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
-use axum::body::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
 use std::path::PathBuf;
@@ -370,10 +370,10 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
         .unwrap_or("");
 
     // OAuth Protected Resource Metadata (RFC 9728). Upstream advertises its own
-    // url as the `resource`, which Claude Code rejects because it dialed the
-    // proxy, not Figma. Rewrite `resource` to the proxy's own origin so the
+    // url as the `resource`, which agents reject because they dialed the proxy,
+    // not Figma. Rewrite `resource` to the proxy's own origin so the
     // SDK's origin check passes; `authorization_servers` is left untouched, so
-    // the OAuth dance still runs directly between Claude Code and api.figma.com
+    // the OAuth dance still runs directly between the agent and api.figma.com
     // and the proxy never sees the token exchange.
     if method == Method::GET && path == "/.well-known/oauth-protected-resource" {
         // SEC-1: cap the PRM body (it's tiny, but the cap applies uniformly).
@@ -389,9 +389,7 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
     if method == Method::GET {
         let builder = apply_resp_headers(Response::builder().status(status), &resp_headers);
         let guarded = sse_idle_guarded(upstream_resp.bytes_stream(), SSE_IDLE_TIMEOUT);
-        return Ok(builder
-            .body(Body::from_stream(guarded))
-            .unwrap());
+        return Ok(builder.body(Body::from_stream(guarded)).unwrap());
     }
 
     // Everything else (the POST request/response exchange) is buffered. Tool
@@ -473,7 +471,9 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
                     );
                     // spawn_blocking so the ledger write does not block the response
                     // path; guarded so an empty batch never schedules a no-op task.
-                    drop(tokio::task::spawn_blocking(move || crate::stats::record_all(recs)));
+                    drop(tokio::task::spawn_blocking(move || {
+                        crate::stats::record_all(recs)
+                    }));
                 }
                 return Ok(buffered(status, &resp_headers, new_text.into_bytes()));
             }
@@ -504,7 +504,9 @@ async fn proxy_once(st: AppState, req: Request, self_origin: &str) -> anyhow::Re
                         "proxied"
                     );
                     // spawn_blocking so the ledger write does not block the response path.
-                    drop(tokio::task::spawn_blocking(move || crate::stats::record_all(recs)));
+                    drop(tokio::task::spawn_blocking(move || {
+                        crate::stats::record_all(recs)
+                    }));
                     let out = serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec());
                     return Ok(buffered(status, &resp_headers, out));
                 }
@@ -559,16 +561,12 @@ fn buffered_bytes(status: StatusCode, h: &HeaderMap, body: Bytes) -> Response {
 /// `chunk()` and returns an error once the accumulated size exceeds `cap`,
 /// preventing OOM / DoS.
 async fn collect_capped(mut resp: reqwest::Response, cap: usize) -> anyhow::Result<Bytes> {
-    let hint = resp
-        .content_length()
-        .map_or(0, |n| (n as usize).min(cap));
+    let hint = resp.content_length().map_or(0, |n| (n as usize).min(cap));
     let mut buf: Vec<u8> = Vec::with_capacity(hint);
 
     while let Some(chunk) = resp.chunk().await? {
         if buf.len() + chunk.len() > cap {
-            anyhow::bail!(
-                "upstream response body exceeded the {cap}-byte cap (possible DoS)"
-            );
+            anyhow::bail!("upstream response body exceeded the {cap}-byte cap (possible DoS)");
         }
         buf.extend_from_slice(&chunk);
     }
@@ -638,8 +636,9 @@ fn sse_idle_guarded(
     idle: Duration,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     // Box::pin gives us an Unpin handle we can hold as unfold state.
-    let pinned: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
-        Box::pin(stream);
+    let pinned: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>,
+    > = Box::pin(stream);
     futures::stream::unfold(Some(pinned), move |state| async move {
         let mut inner = state?; // None → already terminated; yield None.
         match timeout(idle, inner.next()).await {
@@ -655,11 +654,7 @@ fn sse_idle_guarded(
 }
 
 fn default_tee_dir() -> Option<PathBuf> {
-    Some(
-        dirs::data_dir()?
-            .join("figma-rtk")
-            .join("tee"),
-    )
+    Some(dirs::data_dir()?.join("figma-rtk").join("tee"))
 }
 
 /// Resolve the delta-cache persistence file path.
@@ -764,7 +759,10 @@ fn replace_quoted_param(s: &str, key: &str, new_val: &str) -> Option<String> {
     // No current exploit (caller derives new_val from an is_safe_host-screened
     // origin which already excludes quotes); this guard is purely defensive
     // against future callers that relax that invariant.
-    debug_assert!(!new_val.contains('"'), "new_val must not contain a double-quote");
+    debug_assert!(
+        !new_val.contains('"'),
+        "new_val must not contain a double-quote"
+    );
     if new_val.contains('"') {
         return None;
     }
@@ -830,7 +828,10 @@ mod tests {
     fn replace_quoted_param_swaps_only_target() {
         let s = r#"Bearer resource_metadata="https://up/x",scope="mcp:connect""#;
         let out = replace_quoted_param(s, "resource_metadata", "http://proxy/x").unwrap();
-        assert_eq!(out, r#"Bearer resource_metadata="http://proxy/x",scope="mcp:connect""#);
+        assert_eq!(
+            out,
+            r#"Bearer resource_metadata="http://proxy/x",scope="mcp:connect""#
+        );
     }
 
     #[test]
