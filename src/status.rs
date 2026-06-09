@@ -4,6 +4,9 @@
 //! unit-tested without a live socket or file system.
 
 use serde_json::Value;
+use std::path::PathBuf;
+
+use crate::init::Target;
 
 // ─── pure helpers (unit-testable) ────────────────────────────────────────────
 
@@ -12,6 +15,18 @@ use serde_json::Value;
 pub fn mcp_url_matches(mcp_json: &Value, expected_url: &str) -> bool {
     mcp_json
         .get("mcpServers")
+        .and_then(|m| m.get("figma"))
+        .and_then(|f| f.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|u| u == expected_url)
+        .unwrap_or(false)
+}
+
+/// Return `true` iff Codex's `config.toml` has `mcp_servers.figma.url` equal to
+/// `expected_url` exactly.
+pub fn codex_mcp_url_matches(config: &toml::Value, expected_url: &str) -> bool {
+    config
+        .get("mcp_servers")
         .and_then(|m| m.get("figma"))
         .and_then(|f| f.get("url"))
         .and_then(|u| u.as_str())
@@ -34,11 +49,7 @@ pub fn prm_origin_matches(prm_json: &Value, expected_origin: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(resource) else {
         return false;
     };
-    let origin = format!(
-        "{}://{}",
-        url.scheme(),
-        url.host_str().unwrap_or(""),
-    );
+    let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""),);
     let origin = if let Some(port) = url.port() {
         format!("{origin}:{port}")
     } else {
@@ -57,19 +68,49 @@ pub struct CheckResult {
     pub detail: String,
 }
 
+/// Human-facing note about which tool namespace actually flows through frtk.
+pub fn target_usage_note(target: Target) -> &'static str {
+    match target {
+        Target::Codex => {
+            "Use the Codex MCP-server tools (for example `mcp__figma__get_design_context`) \
+for proxied reads. Codex Apps Figma tools (`mcp__codex_apps__figma__*`) bypass frtk."
+        }
+        Target::Claude => {
+            "Use the plugin Figma MCP tools (for example \
+`mcp__plugin_figma_figma__get_design_context`) for proxied reads; account connector \
+tools bypass frtk."
+        }
+    }
+}
+
+pub fn target_usage_json(target: Target) -> Value {
+    match target {
+        Target::Codex => serde_json::json!({
+            "proxied_tool_namespace": "mcp__figma__*",
+            "bypasses_proxy_namespace": "mcp__codex_apps__figma__*",
+            "note": target_usage_note(target),
+        }),
+        Target::Claude => serde_json::json!({
+            "proxied_tool_namespace": "mcp__plugin_figma_figma__*",
+            "bypasses_proxy_namespace": "account connector tools",
+            "note": target_usage_note(target),
+        }),
+    }
+}
+
 /// Run all three status checks and return them in order.
 ///
 /// This function performs live I/O (TCP connect, HTTP GET, file parse) and must
 /// NOT be called from unit tests.
-pub async fn run_checks(port: u16) -> Vec<CheckResult> {
+pub async fn run_checks(target: Target, file: Option<PathBuf>, port: u16) -> Vec<CheckResult> {
     let mut results = Vec::with_capacity(3);
 
     // Check 1 — proxy reachable
     let proxy_up = check_proxy_up(port).await;
     results.push(proxy_up);
 
-    // Check 2 — .mcp.json wired to the proxy
-    results.push(check_mcp_wired(port).await);
+    // Check 2 — agent MCP config wired to the proxy
+    results.push(check_mcp_wired(target, file, port).await);
 
     // Check 3 — OAuth discovery fresh (only when proxy is up)
     if results[0].ok {
@@ -114,13 +155,20 @@ async fn check_proxy_up(port: u16) -> CheckResult {
     }
 }
 
-async fn check_mcp_wired(port: u16) -> CheckResult {
+async fn check_mcp_wired(target: Target, file: Option<PathBuf>, port: u16) -> CheckResult {
+    match target {
+        Target::Codex => check_codex_mcp_wired(file, port).await,
+        Target::Claude => check_claude_mcp_wired(file, port).await,
+    }
+}
+
+async fn check_claude_mcp_wired(file: Option<PathBuf>, port: u16) -> CheckResult {
     let expected = format!("http://127.0.0.1:{port}/mcp");
-    let Some(path) = crate::init::discover_mcp_file() else {
+    let Some(path) = file.or_else(crate::init::discover_mcp_file) else {
         return CheckResult {
             ok: false,
             label: "mcp_wired",
-            detail: "could not find the figma plugin's .mcp.json".into(),
+            detail: "could not find Claude Code's figma plugin .mcp.json".into(),
         };
     };
     let content = match tokio::fs::read_to_string(&path).await {
@@ -152,6 +200,57 @@ async fn check_mcp_wired(port: u16) -> CheckResult {
     } else {
         let actual = v
             .get("mcpServers")
+            .and_then(|m| m.get("figma"))
+            .and_then(|f| f.get("url"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("<missing>")
+            .to_string();
+        CheckResult {
+            ok: false,
+            label: "mcp_wired",
+            detail: format!("url is {actual:?}, expected {expected:?}"),
+        }
+    }
+}
+
+async fn check_codex_mcp_wired(file: Option<PathBuf>, port: u16) -> CheckResult {
+    let expected = format!("http://127.0.0.1:{port}/mcp");
+    let Some(path) = file.or_else(crate::init::discover_codex_config) else {
+        return CheckResult {
+            ok: false,
+            label: "mcp_wired",
+            detail: "could not find Codex config.toml".into(),
+        };
+    };
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult {
+                ok: false,
+                label: "mcp_wired",
+                detail: format!("could not read {}: {e}", path.display()),
+            };
+        }
+    };
+    let v: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            return CheckResult {
+                ok: false,
+                label: "mcp_wired",
+                detail: format!("TOML parse error in {}: {e}", path.display()),
+            };
+        }
+    };
+    if codex_mcp_url_matches(&v, &expected) {
+        CheckResult {
+            ok: true,
+            label: "mcp_wired",
+            detail: format!("{} -> {expected}", path.display()),
+        }
+    } else {
+        let actual = v
+            .get("mcp_servers")
             .and_then(|m| m.get("figma"))
             .and_then(|f| f.get("url"))
             .and_then(|u| u.as_str())
@@ -222,9 +321,7 @@ async fn check_oauth_fresh(port: u16) -> CheckResult {
         CheckResult {
             ok: true,
             label: "oauth_fresh",
-            detail: format!(
-                "resource origin == {expected_origin}"
-            ),
+            detail: format!("resource origin == {expected_origin}"),
         }
     } else {
         let actual = v
@@ -237,7 +334,7 @@ async fn check_oauth_fresh(port: u16) -> CheckResult {
             label: "oauth_fresh",
             detail: format!(
                 "resource={actual:?} origin != {expected_origin}; \
-                 run /mcp -> plugin:figma:figma -> Reconnect in Claude Code \
+                 reconnect the Figma MCP server in your agent \
                  to clear the cached discovery"
             ),
         }
@@ -282,6 +379,85 @@ mod tests {
     fn mcp_url_matches_missing_figma_key() {
         let v = json!({"mcpServers":{}});
         assert!(!mcp_url_matches(&v, "http://127.0.0.1:7337/mcp"));
+    }
+
+    #[test]
+    fn codex_mcp_url_matches_correct_url() {
+        let v: toml::Value = toml::from_str(
+            r#"
+[mcp_servers.figma]
+url = "http://127.0.0.1:7337/mcp"
+"#,
+        )
+        .unwrap();
+        assert!(codex_mcp_url_matches(&v, "http://127.0.0.1:7337/mcp"));
+    }
+
+    #[test]
+    fn codex_mcp_url_matches_rejects_upstream_url() {
+        let v: toml::Value = toml::from_str(
+            r#"
+[mcp_servers.figma]
+url = "https://mcp.figma.com/mcp"
+"#,
+        )
+        .unwrap();
+        assert!(!codex_mcp_url_matches(&v, "http://127.0.0.1:7337/mcp"));
+    }
+
+    #[test]
+    fn codex_mcp_url_matches_missing_figma_key() {
+        let v: toml::Value = toml::from_str(
+            r#"
+[mcp_servers.node_repl]
+command = "node"
+"#,
+        )
+        .unwrap();
+        assert!(!codex_mcp_url_matches(&v, "http://127.0.0.1:7337/mcp"));
+    }
+
+    #[test]
+    fn target_usage_note_warns_codex_apps_bypass_proxy() {
+        let note = target_usage_note(Target::Codex);
+        assert!(note.contains("mcp__figma__"));
+        assert!(note.contains("mcp__codex_apps__figma__"));
+        assert!(note.contains("bypass frtk"));
+    }
+
+    #[test]
+    fn target_usage_json_includes_machine_readable_codex_namespaces() {
+        let value = target_usage_json(Target::Codex);
+        assert_eq!(value["proxied_tool_namespace"], "mcp__figma__*");
+        assert_eq!(
+            value["bypasses_proxy_namespace"],
+            "mcp__codex_apps__figma__*"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_mcp_wired_uses_explicit_codex_config_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "frtk-status-{}-explicit-codex-file",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("custom-config.toml");
+        std::fs::write(
+            &file,
+            r#"
+[mcp_servers.figma]
+url = "http://127.0.0.1:8123/mcp"
+"#,
+        )
+        .unwrap();
+
+        let check = check_mcp_wired(Target::Codex, Some(file.clone()), 8123).await;
+
+        assert!(check.ok, "{check:?}");
+        assert!(check.detail.contains(&file.display().to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── prm_origin_matches ───────────────────────────────────────────────────
