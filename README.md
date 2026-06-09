@@ -7,38 +7,78 @@ command. So `frtk` is not a CLI wrapper like RTK — it's a local MCP reverse
 proxy:
 
 ```
-Claude Code  ──►  frtk (localhost:7337)  ──►  https://mcp.figma.com/mcp
+Codex / Claude Code  ──►  frtk (localhost:7337)  ──►  https://mcp.figma.com/mcp
 ```
 
-It relays every JSON-RPC call verbatim and, for the heavy read tools, compresses
-the response before it reaches the agent.
+It relays every JSON-RPC call verbatim and, for the configured target tools,
+compresses the response before it reaches the agent.
 
 ## What v1 does
 
 - **Transparent relay + auth passthrough.** All paths/methods forwarded as-is.
-  OAuth happens directly between Claude Code and `api.figma.com`; the proxy only
+  OAuth happens directly between the agent and `api.figma.com`; the proxy only
   relays the `Authorization: Bearer` token, so the token audience stays
   `mcp.figma.com`. The proxy never logs headers or bodies.
-- **Read compression** of `get_design_context` and `get_metadata` results.
-  Conservative, near-lossless: JSON minified, XML indentation stripped, code
-  blank-line runs collapsed. Handles both `application/json` and
-  `text/event-stream` (SSE) responses.
+- **Read compression** of Figma target-tool results (`get_design_context`,
+  `get_metadata`, and the other names in `src/mcp.rs`'s `TARGET_TOOLS`).
+  At the default `standard` level this is conservative and near-lossless: JSON
+  minified, XML indentation stripped, code blank-line runs collapsed. Handles
+  both `application/json` and `text/event-stream` (SSE) responses.
+- **Write-tool passthrough.** Write-side tools are deliberately not compressed.
+  Aggressive/ultra filters may drop data, but only at those explicit levels and
+  only for matching target tools.
 - **`gain` meter** — RTK-style token-savings accounting.
 
 ## Usage
 
 ```bash
 cargo build --release
-./target/release/frtk init             # point Claude Code's figma server at the proxy (writes a backup)
+./target/release/frtk init             # point Codex's figma server at the proxy (writes a backup)
 ./target/release/frtk serve            # start the proxy
 ./target/release/frtk gain             # show token savings (--history for recent calls)
-./target/release/frtk init --uninstall # restore the original .mcp.json
+./target/release/frtk init --uninstall # restore the original Codex config
 ```
 
-`frtk init` edits the figma plugin's `.mcp.json` `url` to `http://127.0.0.1:7337/mcp`
-(backing the original up to `.frtk-backup`); then in Claude Code go to
-`/mcp` → `plugin:figma:figma` → **Reconnect** (a plain Claude Code restart may not
-clear the cached OAuth discovery).
+By default, `frtk init` edits Codex's config (`$CODEX_HOME/config.toml`, or
+`~/.codex/config.toml` when `CODEX_HOME` is unset) and writes:
+
+```toml
+[mcp_servers.figma]
+url = "http://127.0.0.1:7337/mcp"
+```
+
+It creates the config file if needed and backs the original file up to
+`config.toml.frtk-backup`. Restart Codex, or reconnect the Figma MCP server if
+the UI exposes MCP reconnect. If you initialize a non-default path with
+`frtk init --file <path>`, check the same file with `frtk status --file <path>`.
+
+In Codex, use the MCP server tools exposed from this config (typically names like
+`mcp__figma__get_design_context`) when you want reads to flow through `frtk`.
+The app-backed Figma connector from Codex Apps exposes tools like
+`mcp__codex_apps__figma__get_design_context`; those bypass `frtk` entirely and
+will not be compressed or captured by this proxy.
+
+In new Codex sessions, the intended setup is to disable the Figma Apps connector
+and leave only the MCP server path:
+
+```text
+mcp__figma__* -> http://127.0.0.1:7337/mcp -> frtk -> Figma
+```
+
+`frtk serve` must be running for this path to work. The quick readiness check is:
+
+```bash
+frtk status --json
+```
+
+The healthy state is `proxy_up: true`, `mcp_wired: true`, and
+`oauth_fresh: true`; agents should then use the `mcp__figma__*` namespace.
+
+Claude Code remains supported with `frtk init --target claude`; that edits the
+Figma plugin `.mcp.json` `url` to `http://127.0.0.1:7337/mcp` and backs the
+original up to `.frtk-backup`. In Claude Code, go to `/mcp` →
+`plugin:figma:figma` → **Reconnect** after changing the URL.
+
 `frtk config` prints the equivalent snippet if you'd rather wire it by hand.
 
 ### Config (optional)

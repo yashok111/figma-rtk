@@ -1,6 +1,6 @@
 //! frtk — Figma MCP token-killer reverse proxy ("RTK for Figma").
 //!
-//! Sits between Claude Code and the remote Figma MCP server
+//! Sits between Codex or Claude Code and the remote Figma MCP server
 //! (https://mcp.figma.com/mcp). It relays every JSON-RPC call verbatim —
 //! including the OAuth Bearer token, which keeps Figma as the token audience —
 //! and transparently compresses the responses of the heavy read tools
@@ -12,7 +12,11 @@ use figma_rtk::{compress, config, filter, init, proxy, stats, status, tokens, tr
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "frtk", version, about = "Token-killer reverse proxy for the Figma MCP server")]
+#[command(
+    name = "frtk",
+    version,
+    about = "Token-killer reverse proxy for the Figma MCP server"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -54,7 +58,7 @@ enum Cmd {
         #[arg(value_enum)]
         shell: Shell,
     },
-    /// Print the Claude Code MCP config snippet, or create a config file.
+    /// Print the MCP config snippet, or create a config file.
     Config {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -64,9 +68,11 @@ enum Cmd {
         #[arg(long)]
         create: bool,
     },
-    /// Point Claude Code's Figma MCP server at the proxy (edits the plugin's
-    /// .mcp.json, with a restorable backup). Run this yourself; restart CC after.
+    /// Point an agent's Figma MCP server at the proxy, with a restorable backup.
     Init {
+        /// Agent config to edit.
+        #[arg(long, value_enum, default_value_t = init::Target::Codex)]
+        target: init::Target,
         /// Path to the MCP config to edit (defaults to the figma plugin's).
         #[arg(long)]
         file: Option<PathBuf>,
@@ -114,9 +120,15 @@ enum Cmd {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// Check that the proxy is running, .mcp.json is wired, and OAuth discovery
+    /// Check that the proxy is running, MCP config is wired, and OAuth discovery
     /// is fresh. Exits nonzero if any check fails.
     Status {
+        /// Agent config to check.
+        #[arg(long, value_enum, default_value_t = init::Target::Codex)]
+        target: init::Target,
+        /// Path to the MCP config to check.
+        #[arg(long)]
+        file: Option<PathBuf>,
         /// Proxy port to probe.
         #[arg(long, default_value_t = 7337)]
         port: u16,
@@ -130,7 +142,13 @@ enum Cmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { host, port, upstream, capture_dir, level } => {
+        Cmd::Serve {
+            host,
+            port,
+            upstream,
+            capture_dir,
+            level,
+        } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -139,7 +157,11 @@ async fn main() -> anyhow::Result<()> {
                 .init();
             proxy::serve(&host, port, &upstream, capture_dir, level).await
         }
-        Cmd::Gain { history, since, watch } => {
+        Cmd::Gain {
+            history,
+            since,
+            watch,
+        } => {
             let since_secs: Option<u64> =
                 since.as_deref().map(stats::parse_duration).transpose()?;
             if watch {
@@ -165,9 +187,22 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Init { file, port, uninstall } => run_init(file, port, uninstall),
-        Cmd::Compress { tool, level, filters } => run_compress(tool, level, filters),
-        Cmd::Verify { filters, filter, require_all } => run_verify(filters, filter, require_all),
+        Cmd::Init {
+            target,
+            file,
+            port,
+            uninstall,
+        } => run_init(target, file, port, uninstall),
+        Cmd::Compress {
+            tool,
+            level,
+            filters,
+        } => run_compress(tool, level, filters),
+        Cmd::Verify {
+            filters,
+            filter,
+            require_all,
+        } => run_verify(filters, filter, require_all),
         Cmd::Trust { path, list } => {
             if list {
                 for d in trust::list() {
@@ -197,7 +232,12 @@ async fn main() -> anyhow::Result<()> {
             clap_complete::generate(shell, &mut cmd, "frtk", &mut std::io::stdout());
             Ok(())
         }
-        Cmd::Status { port, json } => run_status(port, json).await,
+        Cmd::Status {
+            target,
+            file,
+            port,
+            json,
+        } => run_status(target, file, port, json).await,
     }
 }
 
@@ -248,28 +288,56 @@ fn run_verify(
     Ok(())
 }
 
-fn run_init(file: Option<PathBuf>, port: u16, uninstall: bool) -> anyhow::Result<()> {
-    let Some(file) = file.or_else(init::discover_mcp_file) else {
-        anyhow::bail!(
-            "could not find the figma plugin's .mcp.json; pass --file <path> explicitly"
-        )
+fn run_init(
+    target: init::Target,
+    file: Option<PathBuf>,
+    port: u16,
+    uninstall: bool,
+) -> anyhow::Result<()> {
+    let file = match target {
+        init::Target::Codex => file
+            .or_else(init::discover_codex_config)
+            .ok_or_else(|| anyhow::anyhow!("could not find Codex config.toml; pass --file <path> explicitly"))?,
+        init::Target::Claude => file
+            .or_else(init::discover_mcp_file)
+            .ok_or_else(|| anyhow::anyhow!("could not find Claude Code's figma plugin .mcp.json; pass --file <path> explicitly"))?,
     };
     if uninstall {
-        init::uninstall(&file)?;
+        match target {
+            init::Target::Codex => init::uninstall_codex(&file)?,
+            init::Target::Claude => init::uninstall(&file)?,
+        }
         println!("restored {}", file.display());
     } else {
-        init::install(&file, port)?;
+        match target {
+            init::Target::Codex => init::install_codex(&file, port)?,
+            init::Target::Claude => init::install(&file, port)?,
+        }
+        let reconnect = match target {
+            init::Target::Codex => {
+                "Restart Codex, or reconnect the figma MCP server if your UI exposes MCP reconnect."
+            }
+            init::Target::Claude => {
+                "Run `/mcp` -> `plugin:figma:figma` -> Reconnect in Claude Code."
+            }
+        };
         println!(
-            "pointed figma MCP server at http://127.0.0.1:{port}/mcp\n  file:   {}\n  backup: {}.frtk-backup\nRun `frtk serve` and restart Claude Code. Revert with `frtk init --uninstall`.",
+            "pointed {target} figma MCP server at http://127.0.0.1:{port}/mcp\n  file:   {}\n  backup: {}.frtk-backup\nRun `frtk serve`. {reconnect}\n{}\nRevert with `frtk init --target {target} --uninstall`.",
             file.display(),
-            file.display()
+            file.display(),
+            status::target_usage_note(target)
         );
     }
     Ok(())
 }
 
-async fn run_status(port: u16, json_mode: bool) -> anyhow::Result<()> {
-    let checks = status::run_checks(port).await;
+async fn run_status(
+    target: init::Target,
+    file: Option<PathBuf>,
+    port: u16,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    let checks = status::run_checks(target, file, port).await;
 
     if json_mode {
         // Build a small JSON object: {proxy_up, mcp_wired, oauth_fresh}
@@ -277,12 +345,16 @@ async fn run_status(port: u16, json_mode: bool) -> anyhow::Result<()> {
             checks[0].label: checks[0].ok,
             checks[1].label: checks[1].ok,
             checks[2].label: checks[2].ok,
+            "usage": status::target_usage_json(target),
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
         for c in &checks {
             let flag = if c.ok { "[ok]  " } else { "[FAIL]" };
             println!("{flag} {} — {}", c.label, c.detail);
+        }
+        if checks.iter().all(|c| c.ok) {
+            println!("{}", status::target_usage_note(target));
         }
     }
 
@@ -323,7 +395,12 @@ fn run_compress(
 
 fn print_config(host: &str, port: u16) {
     println!(
-        r#"Point Claude Code's Figma MCP server at the proxy.
+        r#"Point Codex or Claude Code's Figma MCP server at the proxy.
+
+Codex ~/.codex/config.toml:
+
+[mcp_servers.figma]
+url = "http://{host}:{port}/mcp"
 
 Project .mcp.json (or the figma plugin's server entry):
 
@@ -340,7 +417,10 @@ Then run the proxy in another terminal:
 
   frtk serve --host {host} --port {port}
 
-OAuth still happens directly between Claude Code and api.figma.com; the proxy
-only relays the Bearer token, so the token audience stays mcp.figma.com."#
+OAuth still happens directly between the agent and api.figma.com; the proxy
+only relays the Bearer token, so the token audience stays mcp.figma.com.
+
+Codex note: use `mcp__figma__*` tools for proxied reads. Codex Apps Figma
+tools (`mcp__codex_apps__figma__*`) bypass frtk."#
     );
 }

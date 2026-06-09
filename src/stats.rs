@@ -127,7 +127,11 @@ pub fn record_all(mut recs: Vec<StatRec>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return;
     };
     for r in recs.iter_mut() {
@@ -156,7 +160,7 @@ pub fn print_gain(history: bool, since: Option<u64>) -> anyhow::Result<()> {
     if recs.is_empty() {
         if all_recs.is_empty() {
             println!("No savings recorded yet.");
-            println!("Start the proxy (`frtk serve`), point Claude Code at it (`frtk config`),");
+            println!("Start the proxy (`frtk serve`), point your agent at it (`frtk config`),");
             println!("then use the Figma read tools.");
         } else {
             // The ledger has data, but nothing inside the --since window.
@@ -190,7 +194,8 @@ pub fn print_gain(history: bool, since: Option<u64>) -> anyhow::Result<()> {
         // && before == after (set by transform_msg for image-only responses). The
         // `before > 0` guard excludes empty (0-byte) structural-mutation records,
         // which also satisfy the equality but carry no image volume to note.
-        if r.tok_before == Some(0) && r.tok_after == Some(0) && r.before == r.after && r.before > 0 {
+        if r.tok_before == Some(0) && r.tok_after == Some(0) && r.before == r.after && r.before > 0
+        {
             has_image_records = true;
         }
         let e = by_tool.entry(r.tool.clone()).or_default();
@@ -224,10 +229,10 @@ pub fn print_gain(history: bool, since: Option<u64>) -> anyhow::Result<()> {
     }
 
     println!();
+    println!("note: $ is a ROUGH estimate anchored to one model tier (Sonnet input ~$3/Mtok).");
     println!(
-        "note: $ is a ROUGH estimate anchored to one model tier (Sonnet input ~$3/Mtok)."
+        "      Actual cost varies ~3x across Haiku/Sonnet/Opus. Override via FRTK_TOKEN_PRICE."
     );
-    println!("      Actual cost varies ~3x across Haiku/Sonnet/Opus. Override via FRTK_TOKEN_PRICE.");
 
     if has_image_records {
         println!();
@@ -373,8 +378,12 @@ mod tests {
             upstream_ms: 0,
             level: String::new(),
         };
-        let rtb = img_rec.tok_before.unwrap_or_else(|| tokens::est(img_rec.before));
-        let rta = img_rec.tok_after.unwrap_or_else(|| tokens::est(img_rec.after));
+        let rtb = img_rec
+            .tok_before
+            .unwrap_or_else(|| tokens::est(img_rec.before));
+        let rta = img_rec
+            .tok_after
+            .unwrap_or_else(|| tokens::est(img_rec.after));
         assert_eq!(rtb, 0, "image record tok_before == 0");
         assert_eq!(rta, 0, "image record tok_after == 0");
         assert_eq!(rtb.saturating_sub(rta), 0, "zero token savings");
@@ -408,7 +417,10 @@ mod tests {
     fn resolve_token_price_defaults() {
         // None -> TOKEN_PRICE_DEFAULT
         let p = resolve_token_price(None);
-        assert!((p - TOKEN_PRICE_DEFAULT).abs() < 1e-15, "expected default price");
+        assert!(
+            (p - TOKEN_PRICE_DEFAULT).abs() < 1e-15,
+            "expected default price"
+        );
     }
 
     #[test]
@@ -421,20 +433,29 @@ mod tests {
     fn resolve_token_price_invalid_falls_back_to_default() {
         // Garbage string -> default
         let p = resolve_token_price(Some("not_a_number"));
-        assert!((p - TOKEN_PRICE_DEFAULT).abs() < 1e-15, "expected default price on bad input");
+        assert!(
+            (p - TOKEN_PRICE_DEFAULT).abs() < 1e-15,
+            "expected default price on bad input"
+        );
     }
 
     #[test]
     fn resolve_token_price_zero_falls_back_to_default() {
         // Zero price is nonsensical -> default
         let p = resolve_token_price(Some("0"));
-        assert!((p - TOKEN_PRICE_DEFAULT).abs() < 1e-15, "expected default price for zero");
+        assert!(
+            (p - TOKEN_PRICE_DEFAULT).abs() < 1e-15,
+            "expected default price for zero"
+        );
     }
 
     #[test]
     fn resolve_token_price_negative_falls_back_to_default() {
         let p = resolve_token_price(Some("-1e-6"));
-        assert!((p - TOKEN_PRICE_DEFAULT).abs() < 1e-15, "expected default for negative");
+        assert!(
+            (p - TOKEN_PRICE_DEFAULT).abs() < 1e-15,
+            "expected default for negative"
+        );
     }
 
     // --- parse_duration ---
@@ -461,26 +482,41 @@ mod tests {
 
     #[test]
     fn parse_duration_unknown_suffix_is_error() {
-        assert!(parse_duration("10x").is_err(), "unknown suffix should be an error");
+        assert!(
+            parse_duration("10x").is_err(),
+            "unknown suffix should be an error"
+        );
     }
 
     #[test]
     fn parse_duration_no_suffix_is_error() {
         // "42" has no suffix (last char is a digit, not s/m/h/d)
-        assert!(parse_duration("42").is_err(), "missing suffix should be an error");
+        assert!(
+            parse_duration("42").is_err(),
+            "missing suffix should be an error"
+        );
     }
 
     #[test]
     fn parse_duration_empty_is_error() {
-        assert!(parse_duration("").is_err(), "empty string should be an error");
+        assert!(
+            parse_duration("").is_err(),
+            "empty string should be an error"
+        );
     }
 
     #[test]
     fn parse_duration_multibyte_suffix_errs_not_panics() {
         // A multi-byte trailing char must yield an error, never panic in split_at
         // on a non-char-boundary byte index.
-        assert!(parse_duration("5ñ").is_err(), "multibyte suffix should be an error");
-        assert!(parse_duration("5日").is_err(), "CJK suffix should be an error");
+        assert!(
+            parse_duration("5ñ").is_err(),
+            "multibyte suffix should be an error"
+        );
+        assert!(
+            parse_duration("5日").is_err(),
+            "CJK suffix should be an error"
+        );
     }
 
     // --- filter_by_cutoff ---
