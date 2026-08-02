@@ -1,0 +1,22 @@
+# Gitea Actions CI (forge-only: .gitea/workflows/ is invisible to GitHub, so
+# the push-mirror does not double-run this). rust-toolchain.toml pins the
+# toolchain — rustup fetches it on the first cargo invocation.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test
