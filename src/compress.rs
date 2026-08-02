@@ -192,11 +192,7 @@ pub fn compress_result_with_min_priority(
                     .get("data")
                     .and_then(|d| d.as_str())
                     .map(|s| s.len())
-                    .or_else(|| {
-                        item.get("url")
-                            .and_then(|u| u.as_str())
-                            .map(|s| s.len())
-                    })
+                    .or_else(|| item.get("url").and_then(|u| u.as_str()).map(|s| s.len()))
                     .or_else(|| {
                         item.get("resource")
                             .and_then(|r| r.as_str())
@@ -684,8 +680,8 @@ fn strip_metadata_pos_attrs(xml: &str) -> String {
         out.push_str(&xml[i..pos]);
         // Skip past the marker (space + name + =") and then skip to the closing ".
         let after_open = pos + mlen; // index of the first byte of the value
-        // Scan for the closing double-quote.  Values are XML-escaped so this is
-        // always a real delimiter (no unescaped `"` appears inside an XML attr value).
+                                     // Scan for the closing double-quote.  Values are XML-escaped so this is
+                                     // always a real delimiter (no unescaped `"` appears inside an XML attr value).
         let mut k = after_open;
         while k < n && bytes[k] != b'"' {
             k += 1;
@@ -773,11 +769,7 @@ fn drop_annotation_excluded(result: &mut Value, min_priority: f64) -> bool {
         }
         // Check audience: if present, non-empty, and does not contain "assistant" → drop.
         if let Some(audience) = ann.get("audience").and_then(|a| a.as_array()) {
-            if !audience.is_empty()
-                && !audience
-                    .iter()
-                    .any(|v| v.as_str() == Some("assistant"))
-            {
+            if !audience.is_empty() && !audience.iter().any(|v| v.as_str() == Some("assistant")) {
                 return false;
             }
         }
@@ -805,7 +797,10 @@ mod tests {
     fn xml_indentation_removed_content_kept() {
         let xml = "<frame name=\"Hero\">\n    <text>Button Label</text>\n</frame>";
         let out = compress_text(xml);
-        assert_eq!(out, "<frame name=\"Hero\"><text>Button Label</text></frame>");
+        assert_eq!(
+            out,
+            "<frame name=\"Hero\"><text>Button Label</text></frame>"
+        );
         // Whitespace-only invariant: removing ALL whitespace from input and output
         // must give identical strings — the transform touched only whitespace chars.
         assert_eq!(
@@ -822,13 +817,14 @@ mod tests {
         let xml = "<root>\n    <item>Привет мир</item>\n    <item>Москва</item>\n</root>";
         let out = compress_text(xml);
         assert_eq!(
-            out,
-            "<root><item>Привет мир</item><item>Москва</item></root>",
+            out, "<root><item>Привет мир</item><item>Москва</item></root>",
             "Cyrillic content must survive XML indent stripping intact"
         );
         // Each Cyrillic char should still be readable as valid UTF-8
-        assert!(out.is_ascii() || out.chars().all(|c| c != char::REPLACEMENT_CHARACTER),
-            "no replacement characters (no char splits)");
+        assert!(
+            out.is_ascii() || out.chars().all(|c| c != char::REPLACEMENT_CHARACTER),
+            "no replacement characters (no char splits)"
+        );
     }
 
     #[test]
@@ -884,7 +880,10 @@ mod tests {
         assert_eq!(sv.before, env.len());
         assert!(sv.after < sv.before, "envelope shrank");
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["result"]["content"][0]["text"], Value::String("{\"a\":1}".into()));
+        assert_eq!(
+            v["result"]["content"][0]["text"],
+            Value::String("{\"a\":1}".into())
+        );
     }
 
     #[test]
@@ -902,12 +901,18 @@ mod tests {
         let env = r#"{"result":{"content":[{"type":"text","text":"{\"vectorPaths\":[1,2],\"name\":\"keep\"}"}]}}"#;
 
         let (agg, sv) = compress_payload(env, "get_design_context", Level::Aggressive, &fs);
-        assert!(!agg.contains("vectorPaths"), "filter drops key at aggressive");
+        assert!(
+            !agg.contains("vectorPaths"),
+            "filter drops key at aggressive"
+        );
         assert!(agg.contains("keep"));
         assert!(sv.after < sv.before);
 
         let (std, _) = compress_payload(env, "get_design_context", Level::Standard, &fs);
-        assert!(std.contains("vectorPaths"), "standard must not apply filters");
+        assert!(
+            std.contains("vectorPaths"),
+            "standard must not apply filters"
+        );
     }
 
     #[test]
@@ -915,8 +920,7 @@ mod tests {
         let jsx = r#"<div className="x" data-node-id="136:2" data-name="Hero — FullHD (1920×1080)"><p data-node-id="136:6">Привет</p></div>"#;
         let out = strip_figma_node_attrs(jsx);
         assert_eq!(
-            out,
-            r#"<div className="x"><p>Привет</p></div>"#,
+            out, r#"<div className="x"><p>Привет</p></div>"#,
             "node-id + data-name removed (incl. leading space), unicode content kept"
         );
     }
@@ -933,11 +937,21 @@ mod tests {
         let out = compress_jsx_code(code);
         // leading indentation removed
         assert!(out.contains("\n<div className=\"a b\">"), "div dedented");
-        assert!(out.contains("\n<p>Привет — мир</p>"), "text line dedented, content intact");
+        assert!(
+            out.contains("\n<p>Привет — мир</p>"),
+            "text line dedented, content intact"
+        );
         // significant template spaces preserved verbatim
-        assert!(out.contains("{`keep  these  spaces`}"), "template spaces preserved");
+        assert!(
+            out.contains("{`keep  these  spaces`}"),
+            "template spaces preserved"
+        );
         // INVARIANT: only whitespace was touched
-        assert_eq!(ws_stripped(code), ws_stripped(&out), "no non-whitespace changed");
+        assert_eq!(
+            ws_stripped(code),
+            ws_stripped(&out),
+            "no non-whitespace changed"
+        );
         assert!(out.len() < code.len(), "smaller");
     }
 
@@ -947,7 +961,10 @@ mod tests {
         // and must NOT be stripped.
         let code = "const x = `\n    indented inside template\n`;\n<div>\n  <p>hi</p>\n</div>";
         let out = compress_jsx_code(code);
-        assert!(out.contains("\n    indented inside template\n"), "template indent kept");
+        assert!(
+            out.contains("\n    indented inside template\n"),
+            "template indent kept"
+        );
         assert!(out.contains("\n<div>"), "non-template indent stripped");
         assert_eq!(ws_stripped(code), ws_stripped(&out));
     }
@@ -963,7 +980,10 @@ mod tests {
             out.starts_with("const t = `  value spaces"),
             "code indent dropped, post-backtick value spaces kept: {out:?}"
         );
-        assert!(out.contains("\n      more`;"), "template-interior line verbatim");
+        assert!(
+            out.contains("\n      more`;"),
+            "template-interior line verbatim"
+        );
         assert!(out.contains("\nreturn t;"), "trailing code dedented");
     }
 
@@ -971,7 +991,10 @@ mod tests {
     fn has_odd_unescaped_backticks_counts_correctly() {
         assert!(has_odd_unescaped_backticks("const x = `"));
         assert!(!has_odd_unescaped_backticks("const x = `y`;"));
-        assert!(!has_odd_unescaped_backticks(r"a \` b"), "escaped backtick not counted");
+        assert!(
+            !has_odd_unescaped_backticks(r"a \` b"),
+            "escaped backtick not counted"
+        );
         assert!(has_odd_unescaped_backticks("`"));
         assert!(!has_odd_unescaped_backticks("no ticks here"));
     }
@@ -1016,7 +1039,10 @@ mod tests {
         let mut agg = mk();
         let _ = compress_result_with(&mut agg, "get_design_context", Level::Aggressive, &fs);
         assert!(
-            agg["content"][0]["text"].as_str().unwrap().contains("data-node-id"),
+            agg["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("data-node-id"),
             "aggressive keeps node ids"
         );
 
@@ -1024,7 +1050,10 @@ mod tests {
         let mut std = mk();
         let _ = compress_result_with(&mut std, "get_design_context", Level::Standard, &fs);
         assert!(
-            std["content"][0]["text"].as_str().unwrap().contains("data-name"),
+            std["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("data-name"),
             "standard keeps data-name"
         );
     }
@@ -1060,11 +1089,23 @@ mod tests {
         let sv = compress_result_with(&mut agg, "get_design_context", Level::Aggressive, &fs);
         let out = serde_json::to_string(&agg).unwrap();
         assert!(!out.contains("SUPER CRITICAL"), "instruction block dropped");
-        assert!(!out.contains("Node ids have been added"), "node-id block dropped");
-        assert!(!out.contains("Images and SVGs will be stored"), "images block dropped");
+        assert!(
+            !out.contains("Node ids have been added"),
+            "node-id block dropped"
+        );
+        assert!(
+            !out.contains("Images and SVGs will be stored"),
+            "images block dropped"
+        );
         assert!(!out.contains("mcpRequestId"), "_meta dropped");
-        assert!(out.contains("export default function Hero"), "code block kept");
-        assert!(out.contains("These styles are contained"), "design-token block kept");
+        assert!(
+            out.contains("export default function Hero"),
+            "code block kept"
+        );
+        assert!(
+            out.contains("These styles are contained"),
+            "design-token block kept"
+        );
         // Savings must credit the dropped boilerplate, not just per-item whitespace.
         assert!(sv.after < sv.before, "reports savings");
         assert!(
@@ -1078,7 +1119,10 @@ mod tests {
         let mut std = mk();
         let _ = compress_result_with(&mut std, "get_design_context", Level::Standard, &fs);
         let out_std = serde_json::to_string(&std).unwrap();
-        assert!(out_std.contains("SUPER CRITICAL"), "standard keeps boilerplate");
+        assert!(
+            out_std.contains("SUPER CRITICAL"),
+            "standard keeps boilerplate"
+        );
         assert!(out_std.contains("mcpRequestId"), "standard keeps _meta");
     }
 
@@ -1090,13 +1134,36 @@ mod tests {
         let mut v: Value = serde_json::json!({
             "content": [{"type": "image", "data": img_data, "mediaType": "image/png"}]
         });
-        let sv = compress_result_with(&mut v, "get_screenshot", Level::Standard, &FilterSet::default());
-        assert_eq!(sv.image_bytes, img_data.len(), "image_bytes == data field length");
-        assert_eq!(sv.before, sv.after, "no text savings for image-only content (before==after==0)");
-        assert!(!sv.mutated, "a pure image block must NOT set sv.mutated — nothing was rewritten");
+        let sv = compress_result_with(
+            &mut v,
+            "get_screenshot",
+            Level::Standard,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            sv.image_bytes,
+            img_data.len(),
+            "image_bytes == data field length"
+        );
+        assert_eq!(
+            sv.before, sv.after,
+            "no text savings for image-only content (before==after==0)"
+        );
+        assert!(
+            !sv.mutated,
+            "a pure image block must NOT set sv.mutated — nothing was rewritten"
+        );
         // The image item must be byte-for-byte identical.
-        assert_eq!(v["content"][0]["data"].as_str(), Some(img_data), "image data unchanged");
-        assert_eq!(v["content"][0]["type"].as_str(), Some("image"), "type unchanged");
+        assert_eq!(
+            v["content"][0]["data"].as_str(),
+            Some(img_data),
+            "image data unchanged"
+        );
+        assert_eq!(
+            v["content"][0]["type"].as_str(),
+            Some("image"),
+            "type unchanged"
+        );
     }
 
     #[test]
@@ -1106,8 +1173,17 @@ mod tests {
         let mut v: Value = serde_json::json!({
             "content": [{"type": "image", "url": url}]
         });
-        let sv = compress_result_with(&mut v, "get_screenshot", Level::Standard, &FilterSet::default());
-        assert_eq!(sv.image_bytes, url.len(), "url length metered when data absent");
+        let sv = compress_result_with(
+            &mut v,
+            "get_screenshot",
+            Level::Standard,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            sv.image_bytes,
+            url.len(),
+            "url length metered when data absent"
+        );
         // Image item must still be unchanged.
         assert_eq!(v["content"][0]["url"].as_str(), Some(url), "url unchanged");
     }
@@ -1124,19 +1200,35 @@ mod tests {
                 {"type": "image", "data": img_data}
             ]
         });
-        let sv = compress_result_with(&mut v, "get_screenshot", Level::Standard, &FilterSet::default());
-        assert_eq!(sv.image_bytes, img_data.len(), "image_bytes set for image block");
+        let sv = compress_result_with(
+            &mut v,
+            "get_screenshot",
+            Level::Standard,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            sv.image_bytes,
+            img_data.len(),
+            "image_bytes set for image block"
+        );
         assert!(sv.before > sv.after, "text block compressed");
-        assert_eq!(v["content"][0]["text"].as_str(), Some("{\"a\":1}"), "text compressed");
-        assert_eq!(v["content"][1]["data"].as_str(), Some(img_data), "image unchanged");
+        assert_eq!(
+            v["content"][0]["text"].as_str(),
+            Some("{\"a\":1}"),
+            "text compressed"
+        );
+        assert_eq!(
+            v["content"][1]["data"].as_str(),
+            Some(img_data),
+            "image unchanged"
+        );
     }
 
     #[test]
     fn compress_result_rewrites_text() {
-        let mut v: Value = serde_json::from_str(
-            r#"{"content":[{"type":"text","text":"{\n  \"x\": 1\n}"}]}"#,
-        )
-        .unwrap();
+        let mut v: Value =
+            serde_json::from_str(r#"{"content":[{"type":"text","text":"{\n  \"x\": 1\n}"}]}"#)
+                .unwrap();
         let sv = compress_result(&mut v);
         assert!(sv.before > sv.after);
         assert_eq!(v["content"][0]["text"], Value::String("{\"x\":1}".into()));
@@ -1199,7 +1291,10 @@ mod tests {
         let mut a = mk();
         let _ = compress_result_with(&mut a, "get_design_context", Level::Aggressive, &fs);
         assert!(
-            a["content"][0]["text"].as_str().unwrap().contains("width=\"9\""),
+            a["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("width=\"9\""),
             "aggressive keeps node-tree geometry"
         );
 
@@ -1207,7 +1302,10 @@ mod tests {
         let mut w = mk();
         let _ = compress_result_with(&mut w, "get_metadata", Level::Ultra, &fs);
         assert!(
-            w["content"][0]["text"].as_str().unwrap().contains("name=\"A\""),
+            w["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("name=\"A\""),
             "node-tree strip is gated to get_design_context"
         );
     }
@@ -1239,8 +1337,17 @@ mod tests {
         let mut v: Value = serde_json::json!({
             "content": [{"type": "text", "text": "hello"}]
         });
-        let sv = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
-        assert_eq!(v["content"].as_array().unwrap().len(), 1, "item without annotations must survive");
+        let sv = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            v["content"].as_array().unwrap().len(),
+            1,
+            "item without annotations must survive"
+        );
         // No mutation from annotation pass (text was already compact, no other filters).
         let _ = sv;
     }
@@ -1252,8 +1359,17 @@ mod tests {
         let mut v: Value = serde_json::json!({
             "content": [{"type": "text", "text": "x", "annotations": {"audience": ["user"], "priority": 1.0}}]
         });
-        let sv = compress_result_with(&mut v, "get_design_context", crate::config::Level::Standard, &FilterSet::default());
-        assert_eq!(v["content"].as_array().unwrap().len(), 1, "standard: annotation drop must not fire");
+        let sv = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Standard,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            v["content"].as_array().unwrap().len(),
+            1,
+            "standard: annotation drop must not fire"
+        );
         let _ = sv;
     }
 
@@ -1266,9 +1382,18 @@ mod tests {
                 {"type": "text", "text": "user only", "annotations": {"audience": ["user"]}}
             ]
         });
-        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        let _ = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &FilterSet::default(),
+        );
         let arr = v["content"].as_array().unwrap();
-        assert_eq!(arr.len(), 1, "user-only item dropped at aggressive: {arr:?}");
+        assert_eq!(
+            arr.len(),
+            1,
+            "user-only item dropped at aggressive: {arr:?}"
+        );
         assert_eq!(arr[0]["text"].as_str().unwrap(), "assistant text");
     }
 
@@ -1281,9 +1406,22 @@ mod tests {
                 {"type": "image", "data": img_data, "annotations": {"audience": ["user"]}}
             ]
         });
-        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
-        assert_eq!(v["content"].as_array().unwrap().len(), 1, "image items must never be dropped by annotation pass");
-        assert_eq!(v["content"][0]["data"].as_str().unwrap(), img_data, "image data unchanged");
+        let _ = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            v["content"].as_array().unwrap().len(),
+            1,
+            "image items must never be dropped by annotation pass"
+        );
+        assert_eq!(
+            v["content"][0]["data"].as_str().unwrap(),
+            img_data,
+            "image data unchanged"
+        );
     }
 
     /// A resource_link item with audience=["user"] must NEVER be dropped regardless of annotations.
@@ -1294,9 +1432,22 @@ mod tests {
                 {"type": "resource_link", "uri": "figma://node/123", "annotations": {"audience": ["user"]}}
             ]
         });
-        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
-        assert_eq!(v["content"].as_array().unwrap().len(), 1, "resource_link items must never be dropped by annotation pass");
-        assert_eq!(v["content"][0]["uri"].as_str().unwrap(), "figma://node/123", "resource_link uri unchanged");
+        let _ = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            v["content"].as_array().unwrap().len(),
+            1,
+            "resource_link items must never be dropped by annotation pass"
+        );
+        assert_eq!(
+            v["content"][0]["uri"].as_str().unwrap(),
+            "figma://node/123",
+            "resource_link uri unchanged"
+        );
     }
 
     /// At default config (min_priority=0.0), an item with priority=0.0 is NOT dropped.
@@ -1307,8 +1458,17 @@ mod tests {
                 {"type": "text", "text": "low prio", "annotations": {"priority": 0.0}}
             ]
         });
-        let _ = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
-        assert_eq!(v["content"].as_array().unwrap().len(), 1, "priority=0.0 must not be dropped at default min_priority=0.0");
+        let _ = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &FilterSet::default(),
+        );
+        assert_eq!(
+            v["content"].as_array().unwrap().len(),
+            1,
+            "priority=0.0 must not be dropped at default min_priority=0.0"
+        );
     }
 
     /// With min_priority=0.5, an item with priority=0.3 is dropped at Aggressive.
@@ -1321,9 +1481,19 @@ mod tests {
                 {"type": "text", "text": "drop", "annotations": {"priority": 0.3}}
             ]
         });
-        let _ = compress_result_with_min_priority(&mut v, "get_design_context", crate::config::Level::Aggressive, &fs, 0.5);
+        let _ = compress_result_with_min_priority(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &fs,
+            0.5,
+        );
         let arr = v["content"].as_array().unwrap();
-        assert_eq!(arr.len(), 1, "priority<min_priority item must be dropped: {arr:?}");
+        assert_eq!(
+            arr.len(),
+            1,
+            "priority<min_priority item must be dropped: {arr:?}"
+        );
         assert_eq!(arr[0]["text"].as_str().unwrap(), "keep");
     }
 
@@ -1335,7 +1505,12 @@ mod tests {
                 {"type": "text", "text": "x", "annotations": {"audience": ["user"]}}
             ]
         });
-        let sv = compress_result_with(&mut v, "get_design_context", crate::config::Level::Aggressive, &FilterSet::default());
+        let sv = compress_result_with(
+            &mut v,
+            "get_design_context",
+            crate::config::Level::Aggressive,
+            &FilterSet::default(),
+        );
         assert!(sv.mutated, "annotation drop must set sv.mutated");
     }
 
@@ -1367,8 +1542,8 @@ mod tests {
         let xml = r#"<frame id="1:1" name="Hero" x="10" y="20" width="1920" height="1080" hidden="false"><text id="1:2" name="Title" x="57" y="321" width="246" height="22" /></frame>"#;
         let out = strip_metadata_pos_attrs(xml);
         // Geometry attrs dropped.
-        assert!(!out.contains(r#" x=""#),  "x attr dropped");
-        assert!(!out.contains(r#" y=""#),  "y attr dropped");
+        assert!(!out.contains(r#" x=""#), "x attr dropped");
+        assert!(!out.contains(r#" y=""#), "y attr dropped");
         assert!(!out.contains(r#" width=""#), "width attr dropped");
         assert!(!out.contains(r#" height=""#), "height attr dropped");
         // Identity attrs kept.
@@ -1393,7 +1568,8 @@ mod tests {
         // The name value contains the literal text "width=99 x=1" — in the real XML
         // this would be encoded as `name="box width=99 x=1"` (no inner quotes because
         // the string has none; spaces and = are valid unescaped inside an XML attr value).
-        let xml = r#"<frame id="2:1" name="box width=99 x=1" x="0" y="0" width="200" height="100" />"#;
+        let xml =
+            r#"<frame id="2:1" name="box width=99 x=1" x="0" y="0" width="200" height="100" />"#;
         let out = strip_metadata_pos_attrs(xml);
         // The tricky name must survive byte-identical.
         assert!(
@@ -1406,7 +1582,10 @@ mod tests {
         assert!(!out.contains(r#" x="0""#), "real x attr dropped");
         assert!(!out.contains(r#" y="0""#), "real y attr dropped");
         assert!(!out.contains(r#" width="200""#), "real width attr dropped");
-        assert!(!out.contains(r#" height="100""#), "real height attr dropped");
+        assert!(
+            !out.contains(r#" height="100""#),
+            "real height attr dropped"
+        );
     }
 
     /// Boundary correctness: `line-height` and `max-width` style attr names must NOT
@@ -1420,8 +1599,8 @@ mod tests {
         assert!(out.contains(r#"line-height="1.5""#), "line-height kept");
         assert!(out.contains(r#"max-width="400""#), "max-width kept");
         // Real geometry dropped.
-        assert!(!out.contains(r#" x="0""#),   "x dropped");
-        assert!(!out.contains(r#" y="0""#),   "y dropped");
+        assert!(!out.contains(r#" x="0""#), "x dropped");
+        assert!(!out.contains(r#" y="0""#), "y dropped");
         assert!(!out.contains(r#" width="100""#), "width dropped");
         assert!(!out.contains(r#" height="20""#), "height dropped");
     }
@@ -1455,8 +1634,14 @@ mod tests {
         let mut ultra_v = mk(xml_text);
         let _ = compress_result_with(&mut ultra_v, "get_metadata", Level::Ultra, &fs);
         let t_ultra = ultra_v["content"][0]["text"].as_str().unwrap();
-        assert!(!t_ultra.contains(r#" x=""#), "ultra strips x from get_metadata");
-        assert!(!t_ultra.contains(r#" width=""#), "ultra strips width from get_metadata");
+        assert!(
+            !t_ultra.contains(r#" x=""#),
+            "ultra strips x from get_metadata"
+        );
+        assert!(
+            !t_ultra.contains(r#" width=""#),
+            "ultra strips width from get_metadata"
+        );
         assert!(t_ultra.contains(r#"id="4:1""#), "ultra keeps id");
         assert!(t_ultra.contains(r#"name="Page""#), "ultra keeps name");
 
@@ -1530,7 +1715,9 @@ mod tests {
              (standard_len={standard_len}, ultra_len={ultra_len})"
         );
         // Report the exact percentage so it appears in test output.
-        eprintln!("strip_metadata_pos_attrs reduction: {reduction_pct:.1}% \
-                   ({standard_len} -> {ultra_len} bytes)");
+        eprintln!(
+            "strip_metadata_pos_attrs reduction: {reduction_pct:.1}% \
+                   ({standard_len} -> {ultra_len} bytes)"
+        );
     }
 }

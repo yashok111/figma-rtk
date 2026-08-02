@@ -52,7 +52,20 @@ pub fn est_str(s: &str) -> usize {
             NON_ASCII
         } else if matches!(
             b,
-            b'=' | b'"' | b'\'' | b';' | b'{' | b'}' | b'/' | b'<' | b'>' | b',' | b'[' | b']' | b'(' | b')' | b':'
+            b'=' | b'"'
+                | b'\''
+                | b';'
+                | b'{'
+                | b'}'
+                | b'/'
+                | b'<'
+                | b'>'
+                | b','
+                | b'['
+                | b']'
+                | b'('
+                | b')'
+                | b':'
         ) {
             PUNCT
         } else {
@@ -146,7 +159,10 @@ mod tests {
         // never raise the token estimate.
         let pretty = "{\n  \"brand/white\": \"#ffffff\",\n  \"spacing/0\": \"0\",\n  \"radius/sm\": \"4px\"\n}";
         let minified = "{\"brand/white\":\"#ffffff\",\"spacing/0\":\"0\",\"radius/sm\":\"4px\"}";
-        assert!(minified.len() < pretty.len(), "minified must be fewer bytes");
+        assert!(
+            minified.len() < pretty.len(),
+            "minified must be fewer bytes"
+        );
         let tok_pretty = est_str(pretty);
         let tok_min = est_str(minified);
         assert!(

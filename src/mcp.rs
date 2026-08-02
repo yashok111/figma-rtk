@@ -96,7 +96,10 @@ pub fn extract_targets(body: &[u8]) -> HashMap<String, Target> {
             continue;
         }
         if let Some(id) = it.get("id") {
-            let args = it.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
+            let args = it
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(Value::Null);
             map.insert(
                 id_to_string(id),
                 Target {
@@ -161,7 +164,8 @@ fn transform_msg(
 
     // Delta cache: collapse a byte-identical re-read to a sentinel.
     if let Some(cache) = cache {
-        if let Some(after) = cache::apply_delta(cache, &target.key, &target.tool, result, orig_before)
+        if let Some(after) =
+            cache::apply_delta(cache, &target.key, &target.tool, result, orig_before)
         {
             // After delta-collapse: content is now the sentinel string.
             let after_text = cache::content_text(result);
@@ -427,7 +431,10 @@ mod tests {
         // quotes are re-escaped (\") in the data line. The minified form is present
         // and the pretty form (indentation `\n  ` and `": "` spacing) is gone —
         // together these prove minification actually happened (not a no-op match).
-        assert!(out.contains(r##"{\"brand/white\":\"#ffffff\",\"spacing/0\":\"0\"}"##), "minified");
+        assert!(
+            out.contains(r##"{\"brand/white\":\"#ffffff\",\"spacing/0\":\"0\"}"##),
+            "minified"
+        );
         assert!(!out.contains(r#"\n  "#), "pretty indentation removed");
         assert!(!out.contains(r#"\": \""#), "colon-space spacing removed");
     }
@@ -436,8 +443,7 @@ mod tests {
     fn use_figma_node_tree_is_a_target_and_minified() {
         // use_figma JSON-serializes its return value; read-only discovery calls
         // return large node trees worth minifying (+ delta-cacheable on re-read).
-        let req =
-            br#"{"id":9,"method":"tools/call","params":{"name":"use_figma","arguments":{}}}"#;
+        let req = br#"{"id":9,"method":"tools/call","params":{"name":"use_figma","arguments":{}}}"#;
         assert_eq!(
             extract_targets(req).get("9").map(|t| t.tool.as_str()),
             Some("use_figma")
@@ -454,8 +460,14 @@ mod tests {
         assert_eq!(recs.len(), 1, "metered");
         // Order-independent: fields preserved + pretty indentation gone (minified).
         assert!(out.contains(r#"\"id\":\"136:2\""#), "id field preserved");
-        assert!(out.contains(r#"\"type\":\"FRAME\""#), "type field preserved");
-        assert!(!out.contains(r#"\n  "#), "pretty indentation removed (minified)");
+        assert!(
+            out.contains(r#"\"type\":\"FRAME\""#),
+            "type field preserved"
+        );
+        assert!(
+            !out.contains(r#"\n  "#),
+            "pretty indentation removed (minified)"
+        );
     }
 
     #[test]
@@ -485,10 +497,25 @@ mod tests {
         let mut ids = HashMap::new();
         ids.insert("3".to_string(), target("get_metadata"));
         let body = "event: message\ndata: {\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"<a><b/></a>\"}]}}\n\n";
-        let (first, _) = transform_sse(body, &ids, Level::Standard, &FilterSet::default(), Some(&cache));
+        let (first, _) = transform_sse(
+            body,
+            &ids,
+            Level::Standard,
+            &FilterSet::default(),
+            Some(&cache),
+        );
         assert!(first.contains("<a><b/></a>"), "first read passes through");
-        let (second, _) = transform_sse(body, &ids, Level::Standard, &FilterSet::default(), Some(&cache));
-        assert!(second.contains("Unchanged"), "identical re-read collapsed to sentinel");
+        let (second, _) = transform_sse(
+            body,
+            &ids,
+            Level::Standard,
+            &FilterSet::default(),
+            Some(&cache),
+        );
+        assert!(
+            second.contains("Unchanged"),
+            "identical re-read collapsed to sentinel"
+        );
         assert!(!second.contains("<a><b/></a>"));
     }
 
@@ -537,10 +564,16 @@ mod tests {
         assert_eq!(recs.len(), 1, "must be metered — CRLF blocks now parsed");
         // The output must be reassembled with CRLF separators (verbatim pass-through
         // of non-target blocks and correct block rejoining).
-        assert!(out.contains("\r\n\r\n") || out.ends_with("\r\n"), "CRLF separator preserved");
+        assert!(
+            out.contains("\r\n\r\n") || out.ends_with("\r\n"),
+            "CRLF separator preserved"
+        );
         // Minified JSON present (pretty-printed form gone). The inner text value is
         // JSON-escaped inside the outer data: line, so check for the escaped form.
-        assert!(out.contains(r#"{\"a\":1,\"b\":2}"#), "content minified (escaped in wire)");
+        assert!(
+            out.contains(r#"{\"a\":1,\"b\":2}"#),
+            "content minified (escaped in wire)"
+        );
     }
 
     // ----- R0-3: new TARGET_TOOLS and image-block metering -----
@@ -549,7 +582,8 @@ mod tests {
     fn get_screenshot_is_a_target_and_produces_stat_rec() {
         // get_screenshot must be in TARGET_TOOLS (matched via __ boundary) and
         // produce a StatRec when the response contains an image block.
-        let req = br#"{"id":10,"method":"tools/call","params":{"name":"get_screenshot","arguments":{}}}"#;
+        let req =
+            br#"{"id":10,"method":"tools/call","params":{"name":"get_screenshot","arguments":{}}}"#;
         assert_eq!(
             extract_targets(req).get("10").map(|t| t.tool.as_str()),
             Some("get_screenshot"),
@@ -575,7 +609,8 @@ mod tests {
                 "result": {
                     "content": [{"type": "image", "data": img_data, "mediaType": "image/png"}]
                 }
-            })).unwrap()
+            }))
+            .unwrap()
         );
         let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
         assert_eq!(recs.len(), 1, "StatRec must be emitted for image block");
@@ -584,7 +619,10 @@ mod tests {
         assert_eq!(rec.before, img_bytes, "before == image_bytes");
         assert_eq!(rec.after, img_bytes, "after == image_bytes (no savings)");
         // Token fields must be explicitly equal so no fake savings are shown.
-        assert_eq!(rec.tok_before, rec.tok_after, "tok_before == tok_after for image records");
+        assert_eq!(
+            rec.tok_before, rec.tok_after,
+            "tok_before == tok_after for image records"
+        );
     }
 
     #[test]
@@ -621,7 +659,8 @@ mod tests {
                 "result": {
                     "content": [{"type": "image", "data": img_data}]
                 }
-            })).unwrap()
+            }))
+            .unwrap()
         );
         let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
         assert_eq!(recs.len(), 1, "StatRec emitted");
@@ -661,7 +700,10 @@ mod tests {
         );
         let (out, recs) = transform_sse(&body, &ids, Level::Aggressive, &fs, None);
         // _meta must have been dropped from the forwarded bytes.
-        assert!(!out.contains("mcpRequestId"), "_meta dropped by structural filter");
+        assert!(
+            !out.contains("mcpRequestId"),
+            "_meta dropped by structural filter"
+        );
         // Deterministically 2 records here: one for the structural mutation (the
         // mutated flag), one for the image url volume (url has length > 0).
         assert_eq!(
@@ -680,7 +722,10 @@ mod tests {
         let args = serde_json::json!({"nodeId": "1:23", "depth": 2});
         let k1 = cache_key("get_metadata", &args);
         let k2 = cache_key("get_metadata", &args);
-        assert_eq!(k1, k2, "cache_key must be byte-stable across calls (FNV-1a)");
+        assert_eq!(
+            k1, k2,
+            "cache_key must be byte-stable across calls (FNV-1a)"
+        );
     }
 
     #[test]
@@ -721,7 +766,11 @@ mod tests {
             serde_json::to_string(compact).unwrap()
         );
         let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
-        assert!(recs.is_empty(), "no StatRec for already-compact content (got {:?})", recs);
+        assert!(
+            recs.is_empty(),
+            "no StatRec for already-compact content (got {:?})",
+            recs
+        );
     }
 
     // ----- R0-3 blocker fix: mixed text+image responses must record image volume -----
@@ -752,10 +801,13 @@ mod tests {
             }))
             .unwrap()
         );
-        let (_out, recs) =
-            transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
+        let (_out, recs) = transform_sse(&body, &ids, Level::Standard, &FilterSet::default(), None);
         // Two StatRecs: one for text savings, one for the image volume.
-        assert_eq!(recs.len(), 2, "separate StatRecs for text savings and image volume");
+        assert_eq!(
+            recs.len(),
+            2,
+            "separate StatRecs for text savings and image volume"
+        );
 
         // Find the image-volume record: tok_before == Some(0) && tok_after == Some(0)
         // and before == after (by the image-volume invariant).

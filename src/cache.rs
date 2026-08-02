@@ -147,7 +147,9 @@ impl DeltaCache {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let Some(key) = v["key"].as_str() else { continue };
+            let Some(key) = v["key"].as_str() else {
+                continue;
+            };
             // Accept hash as either a "0x…" hex string or a plain u64 decimal.
             let hash = if let Some(s) = v["hash"].as_str() {
                 u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
@@ -180,7 +182,11 @@ impl DeltaCache {
             let Ok(key_json) = serde_json::to_string(key) else {
                 continue;
             };
-            let _ = writeln!(file, "{{\"key\":{key_json},\"hash\":\"0x{:016x}\"}}", entry.hash);
+            let _ = writeln!(
+                file,
+                "{{\"key\":{key_json},\"hash\":\"0x{:016x}\"}}",
+                entry.hash
+            );
         }
     }
 }
@@ -249,7 +255,14 @@ pub fn apply_delta(
     original_bytes: usize,
 ) -> Option<usize> {
     let serialized = serde_json::to_string(result).unwrap_or_default();
-    apply_delta_preserialized(cache, key, tool, result, serialized.as_bytes(), original_bytes)
+    apply_delta_preserialized(
+        cache,
+        key,
+        tool,
+        result,
+        serialized.as_bytes(),
+        original_bytes,
+    )
 }
 
 /// Like [`apply_delta`] but reuses an already-serialized representation of
@@ -363,11 +376,14 @@ mod tests {
     fn apply_delta_collapses_identical_reread() {
         let c = DeltaCache::new(8);
         let big = "<node>".repeat(500); // larger than the sentinel
-        // first read: not collapsed
+                                        // first read: not collapsed
         let mut r1 = serde_json::json!({"content":[{"type":"text","text": big.clone()}]});
         let ob1 = content_text_len(&r1);
         assert!(apply_delta(&c, "get_metadata|h", "get_metadata", &mut r1, ob1).is_none());
-        assert!(r1["content"][0]["text"].as_str().unwrap().contains("<node>"));
+        assert!(r1["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<node>"));
         // identical re-read: collapsed to sentinel, reporting the original size
         let mut r2 = serde_json::json!({"content":[{"type":"text","text": big.clone()}]});
         let ob2 = content_text_len(&r2);
@@ -375,7 +391,10 @@ mod tests {
         assert!(after < ob2, "sentinel smaller than original content");
         let sentinel = r2["content"][0]["text"].as_str().unwrap();
         assert!(sentinel.contains("Unchanged"));
-        assert!(sentinel.contains(&ob2.to_string()), "reports original byte count");
+        assert!(
+            sentinel.contains(&ob2.to_string()),
+            "reports original byte count"
+        );
     }
 
     #[test]
@@ -438,7 +457,15 @@ mod tests {
 
         let mut r1b = r.clone();
         let ob2 = content_text_len(&r1b);
-        assert!(apply_delta_preserialized(&c2, "k", "get_metadata", &mut r1b, serialized.as_bytes(), ob2).is_none());
+        assert!(apply_delta_preserialized(
+            &c2,
+            "k",
+            "get_metadata",
+            &mut r1b,
+            serialized.as_bytes(),
+            ob2
+        )
+        .is_none());
 
         // Second call: both should collapse to a sentinel.
         let mut r2a = r.clone();
@@ -450,7 +477,15 @@ mod tests {
         let mut r2b = r.clone();
         let serialized2b = serde_json::to_string(&r2b).unwrap();
         let ob_b = content_text_len(&r2b);
-        let after_b = apply_delta_preserialized(&c2, "k", "get_metadata", &mut r2b, serialized2b.as_bytes(), ob_b).unwrap();
+        let after_b = apply_delta_preserialized(
+            &c2,
+            "k",
+            "get_metadata",
+            &mut r2b,
+            serialized2b.as_bytes(),
+            ob_b,
+        )
+        .unwrap();
         let sentinel_b = r2b["content"][0]["text"].as_str().unwrap().to_string();
 
         // Both must produce the same sentinel content and the same byte-after count.
@@ -491,7 +526,10 @@ mod tests {
     fn fnv1a_differs_for_different_input() {
         let h1 = fnv1a(b"hello");
         let h2 = fnv1a(b"world");
-        assert_ne!(h1, h2, "fnv1a must produce different outputs for different inputs");
+        assert_ne!(
+            h1, h2,
+            "fnv1a must produce different outputs for different inputs"
+        );
     }
 
     #[test]
@@ -561,7 +599,7 @@ mod tests {
         let c = DeltaCache::new(2);
         assert_eq!(c.observe("x", "v1"), Outcome::First); // seq 0
         assert_eq!(c.observe("y", "v2"), Outcome::First); // seq 1 — cap reached
-        // "y" was the most recently inserted; inserting "z" must evict "x", not "y".
+                                                          // "y" was the most recently inserted; inserting "z" must evict "x", not "y".
         assert_eq!(c.observe("z", "v3"), Outcome::First); // seq 2 — evicts min-seq = x
         assert_eq!(
             c.observe("y", "v2"),
@@ -653,7 +691,11 @@ mod tests {
             Outcome::Unchanged,
             "the one valid line must be primed despite surrounding malformed lines"
         );
-        assert_eq!(c2.observe("new_key", "fresh"), Outcome::First, "basic ops still work");
+        assert_eq!(
+            c2.observe("new_key", "fresh"),
+            Outcome::First,
+            "basic ops still work"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

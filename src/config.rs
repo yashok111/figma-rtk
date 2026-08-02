@@ -198,7 +198,10 @@ mod tests {
             "no __ boundary must NOT match"
         );
         // An unrelated tool must not be excluded.
-        assert!(!c.is_excluded("get_design_context"), "unrelated tool must not be excluded");
+        assert!(
+            !c.is_excluded("get_design_context"),
+            "unrelated tool must not be excluded"
+        );
     }
 
     #[test]

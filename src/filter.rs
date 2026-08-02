@@ -106,7 +106,9 @@ impl FilterSet {
                 );
             }
         }
-        Ok(FilterSet { filters: ff.filters })
+        Ok(FilterSet {
+            filters: ff.filters,
+        })
     }
 
     /// Load filters from a TOML file (missing file = empty set).
@@ -291,7 +293,8 @@ mod tests {
     fn drop_keys_removes_recursively() {
         let f = filter("[[filter]]\nname=\"x\"\ntools=[\"t\"]\ndrop_keys=[\"vectorPaths\"]\n");
         let mut v: Value =
-            serde_json::from_str(r#"{"a":{"vectorPaths":[1,2],"name":"n"},"vectorPaths":9}"#).unwrap();
+            serde_json::from_str(r#"{"a":{"vectorPaths":[1,2],"name":"n"},"vectorPaths":9}"#)
+                .unwrap();
         apply_value(&mut v, &f, 0);
         assert_eq!(v, serde_json::json!({"a":{"name":"n"}}));
     }
@@ -348,7 +351,10 @@ mod tests {
     fn for_tool_matches_exact_and_namespaced_only() {
         let fs = FilterSet::parse("[[filter]]\nname=\"x\"\ntools=[\"get_metadata\"]\n").unwrap();
         assert_eq!(fs.for_tool("get_metadata").len(), 1);
-        assert_eq!(fs.for_tool("mcp__plugin_figma_figma__get_metadata").len(), 1);
+        assert_eq!(
+            fs.for_tool("mcp__plugin_figma_figma__get_metadata").len(),
+            1
+        );
         assert_eq!(fs.for_tool("whoami").len(), 0);
         // short / substring names must NOT over-match
         let short = FilterSet::parse("[[filter]]\nname=\"x\"\ntools=[\"a\"]\n").unwrap();
@@ -363,14 +369,16 @@ mod tests {
             "[[filter]]\nname=\"x\"\ntools=[\"t\"]\ndrop_where=[{key=\"opacity\",equals=0}]\n",
         );
         let mut v: Value =
-            serde_json::from_str(r#"{"a":[{"opacity":0.0,"id":1},{"opacity":1.0,"id":2}]}"#).unwrap();
+            serde_json::from_str(r#"{"a":[{"opacity":0.0,"id":1},{"opacity":1.0,"id":2}]}"#)
+                .unwrap();
         apply_value(&mut v, &f, 0);
         assert_eq!(v, serde_json::json!({"a":[{"opacity":1.0,"id":2}]}));
     }
 
     #[test]
     fn apply_text_minifies_and_returns_none_when_unmatched() {
-        let fs = FilterSet::parse("[[filter]]\nname=\"x\"\ntools=[\"t\"]\ndrop_keys=[\"k\"]\n").unwrap();
+        let fs =
+            FilterSet::parse("[[filter]]\nname=\"x\"\ntools=[\"t\"]\ndrop_keys=[\"k\"]\n").unwrap();
         let out = fs.apply_text("t", r#"{ "k": 1, "keep": 2 }"#).unwrap();
         assert_eq!(out, r#"{"keep":2}"#);
         assert!(fs.apply_text("other", r#"{"k":1}"#).is_none());
@@ -424,7 +432,10 @@ mod tests {
         let mut v: Value =
             serde_json::from_str(r#"{"a":[{"text":"keep1"},{"text":"keep2"}]}"#).unwrap();
         apply_value(&mut v, &f, 0);
-        assert_eq!(v, serde_json::json!({"a":[{"text":"keep1"},{"text":"keep2"}]}));
+        assert_eq!(
+            v,
+            serde_json::json!({"a":[{"text":"keep1"},{"text":"keep2"}]})
+        );
     }
 
     #[test]
@@ -457,9 +468,7 @@ mod tests {
     fn max_depth_zero_is_rejected_at_parse_time() {
         // max_depth=0 would replace the root envelope with "…", nuking the whole
         // result. parse() must reject it outright.
-        let err = FilterSet::parse(
-            "[[filter]]\nname=\"x\"\ntools=[\"t\"]\nmax_depth=0\n",
-        );
+        let err = FilterSet::parse("[[filter]]\nname=\"x\"\ntools=[\"t\"]\nmax_depth=0\n");
         assert!(err.is_err(), "max_depth=0 must be rejected at parse time");
         let msg = err.unwrap_err().to_string();
         assert!(
@@ -506,6 +515,9 @@ mod tests {
         let results = run_tests(&fs.filters);
         assert_eq!(results.len(), 2);
         assert!(results[0].passed, "first test should pass");
-        assert!(!results[1].passed, "second expects a dropped key to be present");
+        assert!(
+            !results[1].passed,
+            "second expects a dropped key to be present"
+        );
     }
 }

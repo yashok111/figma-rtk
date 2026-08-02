@@ -13,8 +13,7 @@ use crate::fsutil::{create_private_new, safe_name};
 /// be exercised without requiring a full filesystem or kernel tricks.
 /// Uses an atomic for lock-free reads, and a separate guard lock for serialization.
 #[cfg(test)]
-static FAIL_WRITE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FAIL_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 static GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -146,7 +145,10 @@ mod tests {
         let expected_path = dir.join("get_metadata-0000.json");
         let result = save_next(&dir, "get_metadata", b"partial data");
 
-        assert!(result.is_err(), "expected error on read-only dir, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected error on read-only dir, got {result:?}"
+        );
         assert!(
             !expected_path.exists(),
             "partial file must not remain when open itself failed"
@@ -175,7 +177,10 @@ mod tests {
         let result = save_next(&dir, "get_metadata", b"partial data");
 
         // save_next must have returned an error (injected write failure).
-        assert!(result.is_err(), "expected injected write error, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected injected write error, got {result:?}"
+        );
 
         // The cleanup branch must have removed the partial fixture.
         assert!(
@@ -191,7 +196,10 @@ mod tests {
         // Acquire GUARD_LOCK before clearing FAIL_WRITE so this test cannot clear
         // the flag while write_error_cleans_up_partial_file holds the lock and is
         // relying on the flag being set.
-        let _g = GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _g = GUARD_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let dir = tmp("writes");
@@ -207,7 +215,10 @@ mod tests {
         // Acquire GUARD_LOCK before clearing FAIL_WRITE so this test cannot clear
         // the flag while write_error_cleans_up_partial_file holds the lock and is
         // relying on the flag being set.
-        let _g = GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _g = GUARD_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let dir = tmp("sani");
@@ -224,7 +235,10 @@ mod tests {
         // Acquire GUARD_LOCK before clearing FAIL_WRITE so this test cannot clear
         // the flag while write_error_cleans_up_partial_file holds the lock and is
         // relying on the flag being set.
-        let _g = GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _g = GUARD_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         FAIL_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let dir = tmp("next");
