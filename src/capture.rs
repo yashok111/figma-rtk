@@ -142,6 +142,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        // Root (CI job containers) ignores permission bits, so the injected
+        // open failure never happens there — probe and bail instead of lying.
+        if std::fs::write(dir.join("root-probe"), b"x").is_ok() {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("skipping: perms are advisory for this euid (root?)");
+            return;
+        }
+
         let expected_path = dir.join("get_metadata-0000.json");
         let result = save_next(&dir, "get_metadata", b"partial data");
 
